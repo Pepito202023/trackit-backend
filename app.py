@@ -50,23 +50,30 @@ CORS(app, resources={
 # Initialize JWT
 jwt = JWTManager(app)
 
-# Initialize Firebase
-firebase_service = FirebaseService()
+# Initialize Firebase (wrapped in try-catch to prevent crash on startup)
+try:
+    firebase_service = FirebaseService()
+    print("[OK] Firebase service initialized")
+except Exception as e:
+    print(f"[ERROR] Failed to initialize Firebase: {e}")
+    print("[WARNING] Firebase features will be disabled")
+    firebase_service = None
 
 # Inject shared instance into blueprints that need it
-set_auth_firebase(firebase_service)
-set_attendance_firebase(firebase_service)
-set_user_firebase(firebase_service)
-set_report_firebase(firebase_service)
-set_message_firebase(firebase_service)
-set_ojt_firebase(firebase_service)
-set_face_firebase(firebase_service)
-set_task_firebase(firebase_service)
-set_document_firebase(firebase_service)
-set_company_firebase(firebase_service)
-set_evaluation_firebase(firebase_service)
-set_rules_firebase(firebase_service)
-set_application_plan_firebase(firebase_service)
+if firebase_service:
+    set_auth_firebase(firebase_service)
+    set_attendance_firebase(firebase_service)
+    set_user_firebase(firebase_service)
+    set_report_firebase(firebase_service)
+    set_message_firebase(firebase_service)
+    set_ojt_firebase(firebase_service)
+    set_face_firebase(firebase_service)
+    set_task_firebase(firebase_service)
+    set_document_firebase(firebase_service)
+    set_company_firebase(firebase_service)
+    set_evaluation_firebase(firebase_service)
+    set_rules_firebase(firebase_service)
+    set_application_plan_firebase(firebase_service)
 
 # Register Blueprints
 app.register_blueprint(auth_bp, url_prefix='/api/auth')
@@ -83,12 +90,21 @@ app.register_blueprint(evaluation_bp, url_prefix='/api/evaluations')
 app.register_blueprint(rules_bp, url_prefix='/api/rules')
 app.register_blueprint(application_plan_bp, url_prefix='/api/application-plans')
 
+# Health Check Route (doesn't require Firebase)
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint for Render deployment verification"""
+    return jsonify({"status": "ok", "firebase": "connected" if firebase_service else "disconnected"}), 200
+
 # Dashboard Route
 @app.route('/api/dashboard/stats', methods=['GET'])
 @jwt_required()
 def get_dashboard_stats():
     """Get dashboard statistics"""
     current_user_id = get_jwt_identity()
+    
+    if not firebase_service:
+        return jsonify({"error": "Firebase not available"}), 503
     
     # Get stats from Firebase
     stats = firebase_service.get_dashboard_stats()

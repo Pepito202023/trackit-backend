@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: trackit-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      - key: GOOGLE_CLIENT_ID
+        value: 801818179102-k8urb95atjb6rsqm8mtpgnpsl7qq2tba.apps.googleusercontent.com
+      - key: TRACKIT_WEB_URL
+        value: https://login-system-292a0.web.app
+      # Set these manually in the Render dashboard:
+      # FIREBASE_SERVICE_ACCOUNT_JSON  — paste the full serviceAccountKey JSON as one line
+      # TRACKIT_EMAIL_FROM             — your Gmail address
+      # TRACKIT_EMAIL_PASSWORD         — your Gmail App Password

@@ -33,6 +33,32 @@ STAFF_REPORT_ROLES = {'coordinator', 'chairman', 'adviser', 'supervisor'}
 ROLE_ALIASES = {'admin': 'coordinator', 'employee': 'adviser'}
 
 
+def _upload_to_firebase_storage(image_bytes: bytes, destination_path: str):
+    """Upload bytes to Firebase Storage and return the public download URL."""
+    try:
+        from firebase_admin import storage
+        bucket = storage.bucket()
+        blob = bucket.blob(destination_path)
+        blob.upload_from_string(image_bytes, content_type='image/jpeg')
+        blob.make_public()
+        return blob.public_url
+    except Exception as e:
+        print(f"[ERROR] Firebase Storage upload failed for {destination_path}: {e}")
+        return None
+
+
+def _save_report_image(file) -> str:
+    """Upload one report image to Firebase Storage and return its public URL."""
+    file_ext = os.path.splitext(file.filename or '')[1] or '.jpg'
+    image_bytes = file.read()
+    destination = f'reports/{uuid.uuid4().hex}{file_ext}'
+    url = _upload_to_firebase_storage(image_bytes, destination)
+    if url:
+        return url
+    # Fallback path if Storage upload fails (should not normally happen on Render)
+    return f"/uploads/reports/{uuid.uuid4().hex}{file_ext}"
+
+
 def _staff_can_view_all_reports(role: str) -> bool:
     r = (role or '').lower().strip()
     effective = ROLE_ALIASES.get(r, r)
@@ -57,16 +83,6 @@ def _strip_approval_fields(report: dict) -> dict:
     """Return a copy of the report with approval-related fields removed."""
     restricted = {'approvedBy', 'approvedByName', 'approvedAt', 'reviewedBy', 'reviewedAt'}
     return {k: v for k, v in report.items() if k not in restricted}
-
-
-def _save_report_image(file) -> str:
-    """Save one uploaded image and return its public URL path."""
-    file_ext = os.path.splitext(file.filename or '')[1] or '.jpg'
-    upload_dir = os.path.join(os.path.dirname(__file__), '..', 'uploads', 'reports')
-    os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, f"{uuid.uuid4()}{file_ext}")
-    file.save(file_path)
-    return f"/uploads/reports/{os.path.basename(file_path)}"
 
 
 def _parse_daily_entries(raw) -> list:

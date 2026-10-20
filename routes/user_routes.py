@@ -45,12 +45,26 @@ def _current_user_role(svc: FirebaseService) -> str:
     return _effective_role(current.get('role', ''))
 
 
+def _upload_to_firebase_storage(image_bytes: bytes, destination_path: str):
+    """Upload bytes to Firebase Storage and return the public download URL."""
+    try:
+        from firebase_admin import storage
+        bucket = storage.bucket()
+        blob = bucket.blob(destination_path)
+        blob.upload_from_string(image_bytes, content_type='image/jpeg')
+        blob.make_public()
+        return blob.public_url
+    except Exception as e:
+        print(f"[ERROR] Firebase Storage upload failed for {destination_path}: {e}")
+        return None
+
+
 def _persist_profile_picture(value, user_id: str):
-    """Store data-URL images on disk; keep http(s) and /uploads paths as-is."""
+    """Upload data-URL images to Firebase Storage; keep http(s) URLs as-is."""
     if not value or not isinstance(value, str):
         return value
     s = value.strip()
-    if s.startswith(('http://', 'https://', '/uploads/')):
+    if s.startswith(('http://', 'https://')):
         return s
     if not s.startswith('data:image'):
         return s
@@ -65,11 +79,13 @@ def _persist_profile_picture(value, user_id: str):
         if not raw:
             return s
         filename = f"{user_id}_{uuid.uuid4().hex[:8]}.{ext}"
-        local_dir = os.path.join(os.path.dirname(__file__), '..', 'uploads', 'profile_photos')
-        os.makedirs(local_dir, exist_ok=True)
-        with open(os.path.join(local_dir, filename), 'wb') as f:
-            f.write(raw)
-        return f"/uploads/profile_photos/{filename}"
+        url = _upload_to_firebase_storage(raw, f'profile_photos/{filename}')
+        if url:
+            return url
+        # If Storage upload fails, don't save a huge data-URL
+        if len(s) > 900_000:
+            return None
+        return s
     except Exception as e:
         print(f"[WARNING] persist profile picture failed: {e}")
         if len(s) > 900_000:
@@ -123,9 +139,6 @@ def create_user():
     # Validate email format
     if email and ('@' not in email or '.' not in email.split('@')[-1]):
         return jsonify({'error': 'Invalid email address format'}), 400
-        return jsonify({'error': 'Full name is required'}), 400
-    if not email and not id_number:
-        return jsonify({'error': 'Email or ID number is required'}), 400
     if role not in VALID_ROLES:
         return jsonify({'error': f'Invalid role. Must be one of: {", ".join(sorted(VALID_ROLES))}'}), 400
 

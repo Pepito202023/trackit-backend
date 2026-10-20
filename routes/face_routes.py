@@ -38,17 +38,28 @@ def _get_service():
         _firebase_service = FirebaseService()
     return _firebase_service
 
-# ── Upload directory ──────────────────────────────────────────────────────────
-FACES_DIR = os.path.join(os.path.dirname(__file__), '..', 'uploads', 'faces')
+
+def _upload_to_firebase_storage(image_bytes: bytes, destination_path: str):
+    """Upload bytes to Firebase Storage and return the public download URL."""
+    try:
+        from firebase_admin import storage
+        bucket = storage.bucket()
+        blob = bucket.blob(destination_path)
+        blob.upload_from_string(image_bytes, content_type='image/jpeg')
+        blob.make_public()
+        return blob.public_url
+    except Exception as e:
+        print(f"[ERROR] Firebase Storage upload failed for {destination_path}: {e}")
+        return None
 
 
 def _save_image(image_bytes: bytes, user_id: str, prefix: str = 'face') -> str:
-    """Save image bytes to disk, return relative URL."""
-    os.makedirs(FACES_DIR, exist_ok=True)
+    """Upload image bytes to Firebase Storage, return public URL."""
     filename = f"{prefix}_{user_id}_{uuid.uuid4().hex[:8]}.jpg"
-    path = os.path.join(FACES_DIR, filename)
-    with open(path, 'wb') as f:
-        f.write(image_bytes)
+    url = _upload_to_firebase_storage(image_bytes, f'faces/{filename}')
+    if url:
+        return url
+    # Fallback: return a placeholder path so callers don't get None
     return f"/uploads/faces/{filename}"
 
 

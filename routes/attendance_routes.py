@@ -20,6 +20,20 @@ _firebase_service = None
 STORAGE_BUCKET = os.environ.get('FIREBASE_STORAGE_BUCKET', 'login-system-292a0.appspot.com')
 
 
+def _upload_to_firebase_storage(image_bytes: bytes, destination_path: str):
+    """Upload bytes to Firebase Storage and return the public download URL."""
+    try:
+        from firebase_admin import storage
+        bucket = storage.bucket()
+        blob = bucket.blob(destination_path)
+        blob.upload_from_string(image_bytes, content_type='image/jpeg')
+        blob.make_public()
+        return blob.public_url
+    except Exception as e:
+        print(f"[ERROR] Firebase Storage upload failed for {destination_path}: {e}")
+        return None
+
+
 def set_firebase_service(service):
     global _firebase_service
     _firebase_service = service
@@ -50,8 +64,7 @@ def _read_upload_bytes(file_storage):
 
 def _save_face_photo_bytes(image_bytes: bytes, user_id: str, event: str, filename_hint: str = 'photo.jpg'):
     """
-    Save face photo to local disk (dashboards can load /uploads/...).
-    Firebase Storage disabled - using local storage only.
+    Upload face photo to Firebase Storage; return the public download URL.
     """
     if not image_bytes:
         return None
@@ -60,21 +73,14 @@ def _save_face_photo_bytes(image_bytes: bytes, user_id: str, event: str, filenam
     if ext.lower() not in ('.jpg', '.jpeg', '.png', '.webp'):
         ext = '.jpg'
     filename = f"{event}_{user_id}_{uuid.uuid4().hex[:8]}{ext}"
-    local_url = None
 
-    try:
-        local_dir = os.path.join(os.path.dirname(__file__), '..', 'uploads', 'checkin_photos')
-        os.makedirs(local_dir, exist_ok=True)
-        local_path = os.path.join(local_dir, filename)
-        with open(local_path, 'wb') as f:
-            f.write(image_bytes)
-        local_url = f"/uploads/checkin_photos/{filename}"
-        print(f"[OK] Face photo saved locally: {local_path}")
-    except Exception as e:
-        print(f"[ERROR] Could not save face photo locally: {e}")
-        return None
+    url = _upload_to_firebase_storage(image_bytes, f'checkin_photos/{filename}')
+    if url:
+        print(f"[OK] Face photo uploaded to Firebase Storage: {url}")
+        return url
 
-    return local_url
+    print(f"[ERROR] Could not upload face photo to Firebase Storage")
+    return None
 
 
 def _save_face_photo(file_storage, user_id: str, event: str):

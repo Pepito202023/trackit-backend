@@ -1,54 +1,28 @@
+# Firebase service account credentials — never commit these
+serviceAccountKey.json
+login-system-292a0-firebase-adminsdk-*.json
+
 # Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-ENV/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
+*.pyc
+*.pyo
+*.pyd
 
-# Flask
-instance/
-.webassets-cache
-
-# Environment
+# Environment variables
 .env
-.env.local
+
+# Local uploads (ephemeral on Render)
+uploads/
+
+# Tunnel URL written by START_TRACKIT.bat
+tunnel_url.txt
+
+# Virtual environment
+venv/
+.venv/
+env/
 
 # IDE
-.vscode/
 .idea/
+.vscode/
 *.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Uploads (don't commit user uploads)
-uploads/
-*.jpg
-*.jpeg
-*.png
-*.pdf
-
-# Firebase
-*.json
-!firebase_admin_sdk_key.example.json

@@ -42,7 +42,9 @@ def list_companies():
     # mobile app sees the same establishments as the web admin.
     try:
         seen = {(c.get('name') or '').strip().lower() for c in companies if c.get('name')}
-        for h in (svc.get_hte_profiles() or []):
+        hte_profiles = svc.get_hte_profiles() or []
+        print(f"[list_companies] Found {len(hte_profiles)} HTE profiles")
+        for h in hte_profiles:
             name = (h.get('name') or '').strip()
             if not name:
                 continue
@@ -50,6 +52,8 @@ def list_companies():
             if key in seen:
                 continue
             seen.add(key)
+            # Debug: print HTE profile details
+            print(f"[list_companies] Adding HTE: {name}, skills: {h.get('requiredSkills')}, adviser: {h.get('adviser')}")
             companies.append({
                 'id': h.get('id'),
                 'name': name,
@@ -60,6 +64,8 @@ def list_companies():
                 'description': h.get('description') or '',
                 'status': h.get('status') or 'active',
                 'internCount': h.get('internCount') or 0,
+                'requiredSkills': h.get('requiredSkills') or [],
+                'adviser': h.get('adviser') or h.get('adviserName') or '',
                 'source': 'hte_profiles',
             })
     except Exception as e:
@@ -144,6 +150,7 @@ def create_company():
     document_type = data.get('documentType', '').strip()
     adviser = data.get('adviser', '').strip()
     adviser_id = data.get('adviserId', '').strip()
+    required_skills = data.get('requiredSkills', [])
 
     if not name:
         return jsonify({'error': 'Company name is required'}), 400
@@ -161,6 +168,7 @@ def create_company():
         'documentType': document_type,
         'adviser': adviser,
         'adviserId': adviser_id,
+        'requiredSkills': required_skills,
     })
 
     if result.get('success'):
@@ -199,7 +207,7 @@ def update_company(company_id):
 
     allowed = {'name', 'address', 'supervisor', 'contact', 'contactPhone', 'status', 'description', 'logo',
                'document', 'documentName', 'documentType',
-               'internCapacity', 'totalSlots', 'availableSlots', 'adviser', 'adviserId'}
+               'internCapacity', 'totalSlots', 'availableSlots', 'adviser', 'adviserId', 'requiredSkills'}
     update_data = {k: v for k, v in data.items() if k in allowed}
 
     # Cast slot/capacity fields to int

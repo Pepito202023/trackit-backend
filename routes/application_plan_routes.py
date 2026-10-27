@@ -690,13 +690,14 @@ def upload_hte_excel():
         # Parse rows
         created = []
         failed = []
+        companies_created = []
         row_num = 2  # Start from row 2 (skip header)
-        
+
         for row in sheet.iter_rows(min_row=2, values_only=True):
             if not any(row):  # Skip empty rows
                 row_num += 1
                 continue
-            
+
             try:
                 company_name = str(row[col_indices['Company Name']] or '').strip()
                 location = str(row[col_indices['Location']] or '').strip()
@@ -725,7 +726,7 @@ def upload_hte_excel():
                     'status': 'active',
                     'createdBy': current_user_id,
                 }
-                
+
                 result = svc.create_hte_profile(hte)
                 if result.get('success'):
                     created.append({
@@ -733,6 +734,39 @@ def upload_hte_excel():
                         'company': company_name,
                         'id': result['hte'].get('id'),
                     })
+
+                    # Also create a Partner Company entry
+                    # Check if company already exists
+                    existing_companies = svc.get_companies()
+                    company_exists = any(
+                        (c.get('name') or '').strip().lower() == company_name.lower()
+                        for c in existing_companies
+                    )
+
+                    if not company_exists:
+                        company_data = {
+                            'name': company_name,
+                            'address': location,
+                            'supervisor': supervisor,
+                            'adviser': adviser,
+                            'adviserName': adviser,
+                            'requiredSkills': required_skills,
+                            'contact': '',
+                            'status': 'active',
+                            'internCapacity': 10,
+                            'description': '',
+                        }
+                        company_result = svc.create_company(company_data)
+                        if company_result.get('success'):
+                            companies_created.append({
+                                'company': company_name,
+                                'id': company_result['company'].get('id'),
+                            })
+                            print(f"[HTE Excel upload] Created partner company: {company_name}")
+                        else:
+                            print(f"[HTE Excel upload] Failed to create partner company: {company_name}")
+                    else:
+                        print(f"[HTE Excel upload] Company already exists: {company_name}")
                 else:
                     failed.append({
                         'row': row_num,
@@ -741,13 +775,14 @@ def upload_hte_excel():
                     })
             except Exception as e:
                 failed.append({'row': row_num, 'error': str(e)})
-            
+
             row_num += 1
-        
+
         return jsonify({
             'success': True,
-            'message': f'Processed {len(created) + len(failed)} rows. Created {len(created)} HTE profiles.',
+            'message': f'Processed {len(created) + len(failed)} rows. Created {len(created)} HTE profiles and {len(companies_created)} Partner Companies.',
             'created': created,
+            'companiesCreated': companies_created,
             'failed': failed,
         }), 201
         

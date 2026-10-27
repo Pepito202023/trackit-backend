@@ -16,19 +16,65 @@ Gmail App Password setup:
 
 import os
 import smtplib
+import ssl
 import string
 import random
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from pathlib import Path
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SMTP_HOST = 'smtp.gmail.com'
-SMTP_PORT = 587
+SMTP_SSL_PORT = 465       # Gmail SSL — faster and more reliable than STARTTLS 587
+SMTP_STARTTLS_PORT = 587
+SMTP_TIMEOUT = 60         # Gmail STARTTLS on this network can take 40s+; 15s was too low
 
+_LAST_ERROR = None
+
+# NOTE: Do NOT read env vars here at module level — they may not be loaded yet.
+# Always call _get_email_config() at send time so load_dotenv() has already run.
+
+def _ensure_dotenv():
+    try:
+        from dotenv import load_dotenv
+        env_path = Path(__file__).resolve().parent.parent / '.env'
+        load_dotenv(env_path, override=False)
+    except ImportError:
+        pass
+
+
+def last_email_error():
+    return _LAST_ERROR
+
+
+def _set_error(msg: str):
+    global _LAST_ERROR
+    _LAST_ERROR = msg
+    print(f"[Email] {msg}")
+
+
+def _get_email_config():
+    """Read email credentials from environment at call time (never at import time)."""
+    _ensure_dotenv()
+    ef = (os.environ.get('TRACKIT_EMAIL_FROM') or '').strip()
+    # Gmail App Passwords are 16 chars; strip spaces if the user pasted "xxxx xxxx xxxx xxxx"
+    ep = ''.join((os.environ.get('TRACKIT_EMAIL_PASSWORD') or '').split())
+    wu = os.environ.get('TRACKIT_WEB_URL', 'http://127.0.0.1:5502/web_admin')
+    return ef, ep, wu
+
+# Keep these as lazy properties for backwards-compat with any code that imports them
+def _EMAIL_FROM():  return os.environ.get('TRACKIT_EMAIL_FROM', '')
+def _EMAIL_PASS():  return os.environ.get('TRACKIT_EMAIL_PASSWORD', '')
+
+# Module-level aliases — evaluated lazily via property trick isn't possible for plain
+# variables, so we expose a helper instead. Code that did `from email_service import EMAIL_FROM`
+# should use email_service.EMAIL_FROM which we keep live via __getattr__ below.
 EMAIL_FROM    = os.environ.get('TRACKIT_EMAIL_FROM', '')
 EMAIL_PASS    = os.environ.get('TRACKIT_EMAIL_PASSWORD', '')
 WEB_BASE_URL  = os.environ.get('TRACKIT_WEB_URL', 'http://127.0.0.1:5502/web_admin')
+
+print(f"[Email Service] Loaded. EMAIL_FROM present at import: {bool(EMAIL_FROM)}")
 
 
 # ── Temp-password generator ───────────────────────────────────────────────────
@@ -50,52 +96,154 @@ def generate_temp_password(length: int = 10) -> str:
 
 # ── Email sending ─────────────────────────────────────────────────────────────
 
-def _send(to: str, subject: str, html_body: str) -> bool:
-    """Send a single email. Returns True on success, False on failure."""
-    if not EMAIL_FROM or not EMAIL_PASS:
-        print(
-            f"[Email] NOT CONFIGURED — set TRACKIT_EMAIL_FROM and "
-            f"TRACKIT_EMAIL_PASSWORD in backend/.env then restart the backend. "
-            f"Skipping email to {to}"
+def _open_smtp():
+    """Open an authenticated Gmail SMTP connection. Prefer SSL 465 (faster here)."""
+    global _LAST_ERROR
+    email_from, email_pass, _ = _get_email_config()
+
+    if not email_from or not email_pass:
+        _set_error(
+            'NOT CONFIGURED — set TRACKIT_EMAIL_FROM and '
+            'TRACKIT_EMAIL_PASSWORD in backend/.env then restart the backend.'
         )
-        return False
-    if EMAIL_FROM == 'your.gmail@gmail.com' or EMAIL_PASS == 'abcdefghijklmnop':
-        print(
-            "[Email] PLACEHOLDER VALUES DETECTED — "
-            "replace your.gmail@gmail.com and abcdefghijklmnop in backend/.env "
-            "with your real Gmail address and App Password, then restart."
+        return None
+    if email_from == 'your.gmail@gmail.com' or email_pass == 'abcdefghijklmnop':
+        _set_error(
+            'PLACEHOLDER VALUES DETECTED — replace them in backend/.env with a '
+            'real Gmail address and App Password, then restart.'
         )
-        return False
-    if not to or '@' not in to:
-        print(f"[Email] Invalid recipient address: {to!r}")
+        return None
+
+    attempts = [
+        ('ssl', SMTP_SSL_PORT),
+        ('starttls', SMTP_STARTTLS_PORT),
+    ]
+    last_err = None
+    for mode, port in attempts:
+        try:
+            print(f"[Email] Connecting to {SMTP_HOST}:{port} ({mode})...")
+            if mode == 'ssl':
+                ctx = ssl.create_default_context()
+                server = smtplib.SMTP_SSL(
+                    SMTP_HOST, port, timeout=SMTP_TIMEOUT, context=ctx
+                )
+                server.ehlo()
+            else:
+                server = smtplib.SMTP(SMTP_HOST, port, timeout=SMTP_TIMEOUT)
+                server.ehlo()
+                server.starttls(context=ssl.create_default_context())
+                server.ehlo()
+            server.login(email_from, email_pass)
+            print(f"[Email] Login successful via {mode}:{port}")
+            _LAST_ERROR = None
+            return server
+        except smtplib.SMTPAuthenticationError as e:
+            _set_error(
+                'Gmail login failed — App Password is wrong or expired. '
+                'Generate a new one at Google Account → Security → App Passwords.'
+            )
+            print(f"[Email] Auth error: {e}")
+            return None
+        except Exception as e:
+            last_err = e
+            print(f"[Email] {mode}:{port} failed: {type(e).__name__}: {e}")
+            try:
+                server.close()  # type: ignore[name-defined]
+            except Exception:
+                pass
+
+    _set_error(f'Could not connect to Gmail SMTP: {type(last_err).__name__}: {last_err}')
+    return None
+
+
+class SmtpSession:
+    """Reusable SMTP connection for bulk sends (Excel import)."""
+
+    def __init__(self):
+        self.server = None
+
+    def __enter__(self):
+        self.server = _open_smtp()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.server:
+            try:
+                self.server.quit()
+            except Exception:
+                try:
+                    self.server.close()
+                except Exception:
+                    pass
+        self.server = None
         return False
 
+    def send(self, to: str, subject: str, html_body: str) -> bool:
+        if not self.server:
+            self.server = _open_smtp()
+            if not self.server:
+                return False
+        ok = _deliver(self.server, to, subject, html_body)
+        if not ok:
+            # Connection may have dropped — try one fresh reconnect
+            try:
+                self.server.close()
+            except Exception:
+                pass
+            self.server = _open_smtp()
+            if not self.server:
+                return False
+            ok = _deliver(self.server, to, subject, html_body)
+        return ok
+
+
+def smtp_session() -> SmtpSession:
+    return SmtpSession()
+
+
+def _deliver(server, to: str, subject: str, html_body: str) -> bool:
+    email_from, _, _ = _get_email_config()
+    if not to or '@' not in to:
+        _set_error(f'Invalid recipient address: {to!r}')
+        return False
     msg = MIMEMultipart('alternative')
     msg['Subject'] = subject
-    msg['From']    = f'TrackIt OJT System <{EMAIL_FROM}>'
+    msg['From']    = f'TrackIt OJT System <{email_from}>'
     msg['To']      = to
     msg.attach(MIMEText(html_body, 'html', 'utf-8'))
-
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(EMAIL_FROM, EMAIL_PASS)
-            server.sendmail(EMAIL_FROM, [to], msg.as_string())
+        server.sendmail(email_from, [to], msg.as_string())
         print(f"[Email] ✓ Sent to {to}: {subject}")
         return True
-    except smtplib.SMTPAuthenticationError:
-        print(
-            "[Email] ✗ Authentication failed — your Gmail App Password is wrong or expired. "
-            "Generate a new one at: Google Account → Security → App Passwords"
-        )
-        return False
-    except smtplib.SMTPRecipientsRefused:
-        print(f"[Email] ✗ Recipient refused: {to}")
+    except smtplib.SMTPRecipientsRefused as e:
+        _set_error(f'Recipient refused: {to}')
+        print(f"[Email] ✗ Recipient refused: {to}. Error: {e}")
         return False
     except Exception as e:
-        print(f"[Email] ✗ Failed to send to {to}: {type(e).__name__}: {e}")
+        _set_error(f'Failed to send to {to}: {type(e).__name__}: {e}')
         return False
+
+
+def _send(to: str, subject: str, html_body: str, smtp=None) -> bool:
+    """Send a single email. Returns True on success, False on failure."""
+    print(f"[Email] Attempting to send to {to}...")
+    if smtp is not None:
+        return smtp.send(to, subject, html_body)
+
+    server = _open_smtp()
+    if not server:
+        print(f"[Email] Skipping email to {to}")
+        return False
+    try:
+        return _deliver(server, to, subject, html_body)
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            try:
+                server.close()
+            except Exception:
+                pass
 
 
 # ── Role-specific email templates ─────────────────────────────────────────────
@@ -140,13 +288,14 @@ def _base_html(title: str, body_html: str) -> str:
 
 
 def send_staff_welcome(to: str, name: str, role: str, temp_password: str,
-                       login_identifier: str) -> bool:
+                       login_identifier: str, smtp=None) -> bool:
     """
     Email for Adviser / Supervisor / Chairperson — web login.
     login_identifier is their email address (used to log in).
     """
+    _, _, web_base_url = _get_email_config()
     role_label = role.capitalize()
-    login_url  = f"{WEB_BASE_URL}/login.html"
+    login_url  = f"{web_base_url}/login.html"
     body = f"""
 <p>Hello <strong>{name}</strong>,</p>
 <p>Your <strong>{role_label}</strong> account on TrackIt has been created by the Coordinator.
@@ -171,11 +320,11 @@ def send_staff_welcome(to: str, name: str, role: str, temp_password: str,
 <p>If you have any questions, contact your OJT Coordinator.</p>
 """
     return _send(to, f'Your TrackIt Account — {role_label} Login Credentials', _base_html(
-        f'Welcome to TrackIt, {name}!', body))
+        f'Welcome to TrackIt, {name}!', body), smtp=smtp)
 
 
 def send_student_welcome(to: str, name: str, id_number: str,
-                         temp_password: str) -> bool:
+                         temp_password: str, smtp=None) -> bool:
     """
     Email for Students — Flutter mobile app login.
     Students log in with their ID Number.
@@ -211,10 +360,10 @@ def send_student_welcome(to: str, name: str, id_number: str,
 <p>If you need assistance, contact your OJT Coordinator or Adviser.</p>
 """
     return _send(to, 'Your TrackIt Account — Mobile App Login Credentials', _base_html(
-        f'Welcome to TrackIt, {name}!', body))
+        f'Welcome to TrackIt, {name}!', body), smtp=smtp)
 
 
-def send_welcome_email(user: dict, temp_password: str) -> bool:
+def send_welcome_email(user: dict, temp_password: str, smtp=None) -> bool:
     """
     Dispatch the correct welcome email based on the user's role.
     user dict must have: name, email, role, and optionally idNumber.
@@ -229,10 +378,10 @@ def send_welcome_email(user: dict, temp_password: str) -> bool:
 
     if role == 'student':
         id_number = (user.get('idNumber') or user.get('id_number') or '').strip()
-        return send_student_welcome(email, name, id_number, temp_password)
+        return send_student_welcome(email, name, id_number, temp_password, smtp=smtp)
     else:
         return send_staff_welcome(email, name, role, temp_password,
-                                  login_identifier=email)
+                                  login_identifier=email, smtp=smtp)
 
 
 # ── Password reset email ──────────────────────────────────────────────────────

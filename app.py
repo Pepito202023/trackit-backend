@@ -9,10 +9,11 @@ from flask_jwt_extended import JWTManager, create_access_token, jwt_required, ge
 from datetime import datetime, timedelta
 import os
 
-# Load .env file so TRACKIT_EMAIL_FROM etc. are available as env vars
+# Load backend/.env so TRACKIT_EMAIL_FROM etc. are available even if cwd is not backend/
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    load_dotenv(_env_path, override=True)
 except ImportError:
     pass  # python-dotenv not installed — env vars must be set manually
 

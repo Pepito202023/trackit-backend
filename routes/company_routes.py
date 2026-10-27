@@ -142,6 +142,8 @@ def create_company():
     document_data = data.get('document', '').strip()
     document_name = data.get('documentName', '').strip()
     document_type = data.get('documentType', '').strip()
+    adviser = data.get('adviser', '').strip()
+    adviser_id = data.get('adviserId', '').strip()
 
     if not name:
         return jsonify({'error': 'Company name is required'}), 400
@@ -157,6 +159,8 @@ def create_company():
         'document': document_data,
         'documentName': document_name,
         'documentType': document_type,
+        'adviser': adviser,
+        'adviserId': adviser_id,
     })
 
     if result.get('success'):
@@ -195,7 +199,7 @@ def update_company(company_id):
 
     allowed = {'name', 'address', 'supervisor', 'contact', 'contactPhone', 'status', 'description', 'logo',
                'document', 'documentName', 'documentType',
-               'internCapacity', 'totalSlots', 'availableSlots'}
+               'internCapacity', 'totalSlots', 'availableSlots', 'adviser', 'adviserId'}
     update_data = {k: v for k, v in data.items() if k in allowed}
 
     # Cast slot/capacity fields to int
@@ -222,9 +226,17 @@ def update_company(company_id):
 @company_bp.route('/<company_id>', methods=['DELETE'])
 @jwt_required()
 def delete_company(company_id):
-    """Delete a company by ID"""
+    """Delete a company by ID (also accepts ?name=<name> to delete by name as fallback)"""
     svc = _get_service()
+
+    # Try by ID first
     result = svc.delete_company(company_id)
+
+    # If ID-based delete failed, try name-based fallback
+    if not result.get('success'):
+        name_hint = (request.args.get('name') or '').strip()
+        if name_hint:
+            result = svc.delete_company_by_name(name_hint)
 
     if result.get('success'):
         return jsonify({'message': 'Company deleted successfully'}), 200
@@ -519,6 +531,35 @@ def reassign_student():
         'companyName': new_company.get('name', ''),
         'company': new_company.get('name', ''),
     }
+
+    # Update supervisor from new company
+    new_supervisor = new_company.get('supervisor') or new_company.get('contactPerson') or ''
+    if new_supervisor:
+        student_update['supervisorName'] = new_supervisor
+        # Try to find supervisor user ID
+        try:
+            for doc in svc.db.collection('users').where('role', '==', 'supervisor').get():
+                d = doc.to_dict()
+                if d.get('name', '').strip().lower() == new_supervisor.strip().lower():
+                    student_update['supervisorId'] = doc.id
+                    break
+        except:
+            pass
+
+    # Update adviser from new company
+    new_adviser = new_company.get('adviser') or ''
+    if new_adviser:
+        student_update['adviserName'] = new_adviser
+        # Try to find adviser user ID
+        try:
+            for doc in svc.db.collection('users').where('role', '==', 'adviser').get():
+                d = doc.to_dict()
+                if d.get('name', '').strip().lower() == new_adviser.strip().lower():
+                    student_update['adviserId'] = doc.id
+                    break
+        except:
+            pass
+
     svc.update_user(student_id, student_update)
 
     # Update old company's intern count

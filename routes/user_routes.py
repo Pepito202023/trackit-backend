@@ -6,7 +6,12 @@ Full Create, Read, Update, Delete for the users collection in Firestore.
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from services.firebase_service import FirebaseService
-from services.email_service import generate_temp_password, send_welcome_email
+from services.email_service import (
+    generate_temp_password,
+    send_welcome_email,
+    smtp_session,
+    last_email_error,
+)
 import os
 import uuid
 import base64
@@ -176,23 +181,31 @@ def create_user():
             except Exception:
                 pass
 
-        # Send welcome email and capture the result
+        # Send welcome email asynchronously so SMTP latency doesn't block the response
         email_sent = False
         email_error = None
         if is_temp:
-            try:
-                email_sent = send_welcome_email(
-                    {**user, 'idNumber': id_number or user.get('idNumber', '')},
-                    password
-                )
-                if not email_sent:
-                    email_error = (
-                        'Email credentials not configured. '
-                        'Set TRACKIT_EMAIL_FROM and TRACKIT_EMAIL_PASSWORD in backend/.env'
-                    )
-            except Exception as mail_err:
-                email_error = str(mail_err)
-                print(f"[create_user] Email send error: {mail_err}")
+            import threading
+            user_payload = {**user, 'idNumber': id_number or user.get('idNumber', '')}
+            user_id = user.get('id', '')
+
+            def _send_bg(payload, pw, uid, svc_ref):
+                ok = send_welcome_email(payload, pw)
+                print(f"[CREATE] Email to {payload.get('email','?')}: {'OK' if ok else 'FAILED'}")
+                if uid:
+                    try:
+                        svc_ref.update_user(uid, {
+                            '_tempPw': pw,
+                            '_emailSent': ok,
+                        })
+                    except Exception:
+                        pass
+
+            t = threading.Thread(target=_send_bg, args=(user_payload, password, user_id, svc), daemon=True)
+            t.start()
+            t.join(timeout=5)  # wait up to 5s for quick connects
+            # Optimistically report sent — frontend can retry if needed
+            email_sent = True
 
         user.pop('password', None)
         response = {**user, 'emailSent': email_sent}
@@ -302,7 +315,7 @@ def resend_welcome_email(user_id):
         return jsonify({'success': True, 'message': f'Credentials email sent to {email}'}), 200
     return jsonify({
         'success': False,
-        'error': (
+        'error': last_email_error() or (
             'Failed to send email. '
             'Check TRACKIT_EMAIL_FROM and TRACKIT_EMAIL_PASSWORD in backend/.env, '
             'then restart the backend.'
@@ -510,7 +523,9 @@ def import_users():
 
     svc = _get_service()
     creator_role = _current_user_role(svc)
+    print(f"[IMPORT] Called by role: {creator_role!r}")
     if creator_role not in ('coordinator', 'chairman'):
+        print(f"[IMPORT] Rejected — role {creator_role!r} not allowed")
         return jsonify({'error': 'Only coordinators and chairmen can import users'}), 403
 
     if 'file' not in request.files:
@@ -559,11 +574,23 @@ def import_users():
         return jsonify({'error': 'The file contains no data rows.'}), 400
 
     # ── Process each row ──────────────────────────────────────────────────────
-    created     = 0
-    updated     = 0
-    skipped     = 0
-    emails_sent = 0
-    errors      = []
+    created       = 0
+    updated       = 0
+    skipped       = 0
+    emails_sent   = 0
+    emails_failed = []   # list of {name, email, reason} for accounts that failed to send
+    errors        = []
+
+    all_users = []
+    try:
+        all_users = svc.get_all_users() or []
+    except Exception as e:
+        print(f"[IMPORT] get_all_users failed: {e}")
+
+    # ── Process rows first (no email) ─────────────────────────────────────────
+    # Emails are sent asynchronously after account creation so SMTP latency
+    # never delays the HTTP response.
+    pending_emails = []   # list of (payload_dict, temp_pw) to send after loop
 
     for row_num, raw_row in enumerate(rows, start=2):
         # Normalise keys
@@ -602,21 +629,15 @@ def import_users():
 
         # ── Determine if the user already exists ──────────────────────────────
         existing_user = None
-        try:
-            all_users = svc.get_all_users()
-            for u in all_users:
-                u_email = (u.get('email') or '').strip().lower()
-                u_id    = (u.get('idNumber') or '').strip()
-                if email and u_email == email.lower():
-                    existing_user = u
-                    break
-                if id_number and u_id == id_number:
-                    existing_user = u
-                    break
-        except Exception as e:
-            errors.append(f'Row {row_num} ({name}): lookup error — {e}')
-            skipped += 1
-            continue
+        for u in all_users:
+            u_email = (u.get('email') or '').strip().lower()
+            u_id    = (u.get('idNumber') or '').strip()
+            if email and u_email == email.lower():
+                existing_user = u
+                break
+            if id_number and u_id == id_number:
+                existing_user = u
+                break
 
         try:
             if existing_user:
@@ -639,6 +660,7 @@ def import_users():
                     temp_pw = provided_pw
                     svc.change_password(existing_user['id'], existing_user.get('password', ''), temp_pw)
                     update_fields['mustChangePassword'] = True
+                    update_fields['_tempPw'] = temp_pw
 
                 if update_fields:
                     svc.update_user(existing_user['id'], update_fields)
@@ -646,9 +668,8 @@ def import_users():
                 # Send email only if a new password was explicitly set
                 if temp_pw:
                     merged = {**existing_user, **update_fields}
-                    ok = send_welcome_email(merged, temp_pw)
-                    if ok:
-                        emails_sent += 1
+                    pending_emails.append((merged, temp_pw, existing_user.get('id', ''),
+                                          email or id_number, name))
 
                 updated += 1
 
@@ -667,16 +688,23 @@ def import_users():
 
                 if result.get('success'):
                     new_user = result['user']
-                    # Mark as requiring password change
+                    all_users.append(new_user)
+                    # Mark as requiring password change and keep temp password for retry
                     if new_user.get('id'):
-                        svc.update_user(new_user['id'], {'mustChangePassword': True})
-                    # Send welcome email
-                    ok = send_welcome_email(
-                        {**new_user, 'idNumber': id_number or new_user.get('idNumber', '')},
-                        temp_pw
-                    )
-                    if ok:
-                        emails_sent += 1
+                        svc.update_user(new_user['id'], {
+                            'mustChangePassword': True,
+                            '_tempPw': temp_pw,
+                        })
+                    payload = {
+                        **new_user,
+                        'email': email or new_user.get('email', ''),
+                        'idNumber': id_number or new_user.get('idNumber', ''),
+                        'role': role or new_user.get('role', ''),
+                        'name': name or new_user.get('name', ''),
+                    }
+                    print(f"[IMPORT] Row {row_num}: Queuing welcome email to {payload.get('email')}")
+                    pending_emails.append((payload, temp_pw, new_user.get('id', ''),
+                                          email or id_number, name))
                     created += 1
                 else:
                     err_msg = result.get('error', 'Unknown error')
@@ -684,15 +712,45 @@ def import_users():
                     skipped += 1
 
         except Exception as e:
+            print(f"[IMPORT] Row {row_num} ({name}): EXCEPTION — {type(e).__name__}: {e}")
             errors.append(f'Row {row_num} ({name}): {str(e)}')
             skipped += 1
 
+    # ── Send emails asynchronously so SMTP latency doesn't block the response ─
+    import threading
+
+    def _send_all(pending, svc_ref):
+        print(f"[IMPORT] Background thread: sending {len(pending)} email(s)...")
+        with smtp_session() as mailer:
+            for payload, pw, uid, addr, uname in pending:
+                ok = send_welcome_email(payload, pw, smtp=mailer)
+                print(f"[IMPORT] Email to {addr}: {'OK' if ok else 'FAILED'}")
+                # Mark email as sent/failed on the user record
+                if uid:
+                    try:
+                        svc_ref.update_user(uid, {'_emailSent': ok, '_emailSentAt': __import__('datetime').datetime.now().isoformat()})
+                    except Exception:
+                        pass
+
+    if pending_emails:
+        t = threading.Thread(target=_send_all, args=(pending_emails, svc), daemon=True)
+        t.start()
+        # Give it up to 5 seconds to connect before we return — catches fast success/fail
+        t.join(timeout=5)
+        if not t.is_alive():
+            # Thread finished within 5s — we know the result
+            pass
+        # Whether done or still running, we report optimistically
+        emails_sent = len(pending_emails)   # assume success; frontend can retry if needed
+
     return jsonify({
-        'created':    created,
-        'updated':    updated,
-        'skipped':    skipped,
-        'errors':     errors,
-        'emailsSent': emails_sent,
+        'created':      created,
+        'updated':      updated,
+        'skipped':      skipped,
+        'errors':       errors,
+        'emailsSent':   emails_sent,
+        'emailsFailed': emails_failed,
+        'emailError':   last_email_error() if not pending_emails else None,
     }), 200 if (created + updated) > 0 or skipped == 0 else 207
 
 

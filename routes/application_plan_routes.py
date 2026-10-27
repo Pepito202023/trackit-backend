@@ -433,6 +433,8 @@ def create_hte():
         'availableSlots': int(data.get('availableSlots', 0)),
         'totalSlots': int(data.get('totalSlots', 0)),
         'status': (data.get('status') or 'active').strip(),
+        'adviser': (data.get('adviser') or '').strip(),
+        'adviserId': (data.get('adviserId') or '').strip(),
         'createdBy': current_user_id,
     }
 
@@ -460,6 +462,7 @@ def update_hte(hte_id):
         'name', 'location', 'address', 'contactPerson', 'contactEmail',
         'contactPhone', 'description', 'fieldOfWork', 'requiredCourses',
         'requiredSkills', 'availableSlots', 'totalSlots', 'status',
+        'adviser', 'adviserId',
     }
     update = {k: v for k, v in data.items() if k in allowed}
     if 'availableSlots' in update:
@@ -621,6 +624,138 @@ def upload_hte_document():
         'hte': result['hte'],
         'extractedFields': list(parsed.keys()),
     }), 201
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTE EXCEL UPLOAD  POST /api/application-plans/htes/upload-excel
+# Accepts an Excel file (.xlsx or .xls) with HTE companies and creates HTE profiles.
+# Required columns: Company Name, Location, Required Skills, Adviser
+# ─────────────────────────────────────────────────────────────────────────────
+
+@application_plan_bp.route('/htes/upload-excel', methods=['POST'])
+@jwt_required()
+def upload_hte_excel():
+    """
+    POST /api/application-plans/htes/upload-excel
+    Accepts multipart/form-data with field 'file' (.xlsx or .xls).
+    Expected columns: Company Name, Location, Required Skills, Supervisor, Adviser
+    Creates HTE profiles for each valid row.
+    Returns success message with count of created/failed entries.
+    """
+    svc = _get_service()
+    current_user_id = get_jwt_identity()
+
+    user = svc.get_user(current_user_id)
+    role = (user or {}).get('role', 'student')
+    if role not in ('coordinator', 'chairman', 'admin'):
+        return jsonify({'error': 'Permission denied'}), 403
+
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+
+    uploaded = request.files['file']
+    filename = (uploaded.filename or '').lower()
+    if not (filename.endswith('.xlsx') or filename.endswith('.xls')):
+        return jsonify({'error': 'Only Excel files (.xlsx or .xls) are supported'}), 400
+
+    file_bytes = uploaded.read()
+    if not file_bytes:
+        return jsonify({'error': 'Uploaded file is empty'}), 400
+
+    # ── Parse Excel file ──────────────────────────────────────────────────────
+    try:
+        import io
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+        sheet = wb.active
+        
+        # Get header row
+        headers = []
+        for cell in sheet[1]:
+            headers.append(str(cell.value).strip() if cell.value else '')
+        
+        # Validate required columns
+        required_columns = ['Company Name', 'Location', 'Required Skills', 'Supervisor', 'Adviser']
+        missing_columns = [col for col in required_columns if col not in headers]
+        if missing_columns:
+            return jsonify({
+                'error': f'Missing required columns: {", ".join(missing_columns)}',
+                'requiredColumns': required_columns,
+                'foundColumns': headers,
+            }), 400
+        
+        # Map column names to indices
+        col_indices = {col: idx for idx, col in enumerate(headers)}
+        
+        # Parse rows
+        created = []
+        failed = []
+        row_num = 2  # Start from row 2 (skip header)
+        
+        for row in sheet.iter_rows(min_row=2, values_only=True):
+            if not any(row):  # Skip empty rows
+                row_num += 1
+                continue
+            
+            try:
+                company_name = str(row[col_indices['Company Name']] or '').strip()
+                location = str(row[col_indices['Location']] or '').strip()
+                required_skills_str = str(row[col_indices['Required Skills']] or '').strip()
+                supervisor = str(row[col_indices['Supervisor']] or '').strip()
+                adviser = str(row[col_indices['Adviser']] or '').strip()
+
+                if not company_name:
+                    failed.append({'row': row_num, 'error': 'Company Name is required'})
+                    row_num += 1
+                    continue
+
+                # Parse skills (comma-separated)
+                required_skills = [s.strip() for s in required_skills_str.split(',') if s.strip()]
+
+                # Create HTE profile
+                hte = {
+                    'name': company_name,
+                    'location': location,
+                    'address': location,
+                    'requiredSkills': required_skills,
+                    'supervisor': supervisor,
+                    'adviser': adviser,
+                    'availableSlots': 10,  # Default slots
+                    'totalSlots': 10,
+                    'status': 'active',
+                    'createdBy': current_user_id,
+                }
+                
+                result = svc.create_hte_profile(hte)
+                if result.get('success'):
+                    created.append({
+                        'row': row_num,
+                        'company': company_name,
+                        'id': result['hte'].get('id'),
+                    })
+                else:
+                    failed.append({
+                        'row': row_num,
+                        'company': company_name,
+                        'error': result.get('error', 'Unknown error'),
+                    })
+            except Exception as e:
+                failed.append({'row': row_num, 'error': str(e)})
+            
+            row_num += 1
+        
+        return jsonify({
+            'success': True,
+            'message': f'Processed {len(created) + len(failed)} rows. Created {len(created)} HTE profiles.',
+            'created': created,
+            'failed': failed,
+        }), 201
+        
+    except ImportError:
+        return jsonify({'error': 'openpyxl library not installed. Run: pip install openpyxl'}), 500
+    except Exception as e:
+        print(f"[HTE Excel upload] Error: {e}")
+        return jsonify({'error': f'Failed to process Excel file: {str(e)}'}), 400
 
 
 # ─────────────────────────────────────────────────────────────────────────────

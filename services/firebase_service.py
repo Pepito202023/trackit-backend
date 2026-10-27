@@ -561,6 +561,8 @@ class FirebaseService:
     def create_user_by_id(self, id_number: str, password: str, name: str, role: str = 'employee', department: str = None, email: str = None, company: str = None) -> Dict:
         """Create new user by ID number"""
         try:
+            hashed_password = _hash_password(password)
+
             if self.db:
                 # Check if ID number already exists in Firestore
                 users_ref = self.db.collection('users')
@@ -576,7 +578,7 @@ class FirebaseService:
                 # Create new user in Firestore
                 user_data = {
                     'idNumber': id_number,
-                    'password': password,
+                    'password': hashed_password,
                     'name': name,
                     'role': role,
                     'status': 'active',
@@ -592,10 +594,11 @@ class FirebaseService:
                 
                 doc_ref = self.db.collection('users').add(user_data)
                 user_data['id'] = doc_ref[1].id
-                
+                safe = dict(user_data)
+                safe.pop('password', None)
                 return {
                     'success': True,
-                    'user': user_data
+                    'user': safe
                 }
             else:
                 # Fallback to in-memory storage
@@ -610,9 +613,10 @@ class FirebaseService:
                 new_user = {
                     'id': user_id,
                     'idNumber': id_number,
-                    'password': password,
+                    'password': hashed_password,
                     'name': name,
                     'role': role,
+                    'status': 'active',
                     'createdAt': datetime.now().isoformat()
                 }
                 
@@ -625,10 +629,11 @@ class FirebaseService:
                 
                 self.users_db[user_id] = new_user
                 self._save_users_to_file()
-                
+                safe = dict(new_user)
+                safe.pop('password', None)
                 return {
                     'success': True,
-                    'user': new_user
+                    'user': safe
                 }
         except Exception as e:
             print(f"Error creating user: {e}")
@@ -942,10 +947,14 @@ class FirebaseService:
         """Get dashboard statistics"""
         try:
             if self.db:
-                # Get counts from Firestore
-                users_ref = self.db.collection('users')
-                students = list(users_ref.where('role', '==', 'student').get())
+                # Count students using the same method as GET /users?role=student
+                # (get_all_users normalizes roles, so this is more reliable than a raw where query)
+                all_users = self.get_all_users()
+                ROLE_ALIASES = {'admin': 'coordinator', 'employee': 'adviser'}
+                def _eff(r): return ROLE_ALIASES.get((r or '').lower().strip(), (r or '').lower().strip())
+                students = [u for u in all_users if _eff(u.get('role', '')) == 'student']
                 total_employees = len(students)
+                print(f"[dashboard_stats] total students: {total_employees}")
                 
                 # Get today's attendance
                 today = datetime.now().strftime('%Y-%m-%d')
@@ -1204,29 +1213,45 @@ class FirebaseService:
             if self.db:
                 attendance_ref = self.db.collection('attendance')
                 query = attendance_ref
-                
+
                 if user_id:
                     query = query.where('userId', '==', user_id)
                 if employee_id:
                     query = query.where('employeeId', '==', employee_id)
                 if date:
                     query = query.where('date', '==', date)
-                
+
+                docs = list(query.get())
+
+                # Build a user lookup map in one batch to avoid N separate Firestore reads
+                user_ids = {d.to_dict().get('userId') for d in docs if d.to_dict().get('userId')}
+                user_map = {}
+                for uid in user_ids:
+                    u = self.get_user(uid)
+                    if u:
+                        user_map[uid] = u
+
                 records = []
-                for doc in query.get():
+                for doc in docs:
                     record_data = doc.to_dict()
                     record_data['id'] = doc.id
                     self.hydrate_attendance_photos(record_data)
-                    
-                    # Get student name from user
+
+                    # Apply start_date / end_date filter (Firestore range query needs an index;
+                    # filter in Python instead to avoid index requirement)
+                    rec_date = record_data.get('date', '')
+                    if start_date and rec_date < start_date:
+                        continue
+                    if end_date and rec_date > end_date:
+                        continue
+
                     student_id = record_data.get('userId')
-                    if student_id:
-                        student = self.get_user(student_id)
-                        if student:
-                            record_data['employeeName'] = student.get('name', 'Unknown')
-                    
+                    if student_id and student_id in user_map:
+                        student = user_map[student_id]
+                        record_data['employeeName'] = student.get('name', 'Unknown')
+
                     records.append(record_data)
-                
+
                 return records
             else:
                 records = list(self.attendance_db.values())
@@ -2513,20 +2538,78 @@ class FirebaseService:
     def delete_company(self, company_id: str) -> Dict:
         """Delete a company by ID"""
         try:
+            deleted = False
             if self.db:
+                # 1. Try exact ID match in companies collection
                 doc_ref = self.db.collection('companies').document(company_id)
-                if not doc_ref.get().exists:
-                    return {'success': False, 'error': 'Company not found'}
-                doc_ref.delete()
+                if doc_ref.get().exists:
+                    doc_ref.delete()
+                    deleted = True
+                    print(f"[delete_company] Deleted from companies: {company_id}")
+
+                # 2. Try exact ID match in hte_profiles collection
+                if not deleted:
+                    hte_ref = self.db.collection('hte_profiles').document(company_id)
+                    if hte_ref.get().exists:
+                        hte_ref.delete()
+                        deleted = True
+                        print(f"[delete_company] Deleted from hte_profiles: {company_id}")
+
+                # 3. Scan hte_profiles — match by id field stored inside doc
+                if not deleted:
+                    for doc in self.db.collection('hte_profiles').get():
+                        d = doc.to_dict()
+                        if d.get('id') == company_id:
+                            self.db.collection('hte_profiles').document(doc.id).delete()
+                            deleted = True
+                            print(f"[delete_company] Deleted hte_profiles by inner id field: {doc.id}")
+                            break
+
+                # 4. Scan companies — match by id field stored inside doc
+                if not deleted:
+                    for doc in self.db.collection('companies').get():
+                        d = doc.to_dict()
+                        if d.get('id') == company_id:
+                            self.db.collection('companies').document(doc.id).delete()
+                            deleted = True
+                            print(f"[delete_company] Deleted companies by inner id field: {doc.id}")
+                            break
+
+            if deleted:
                 return {'success': True}
-            if not hasattr(self, 'companies_db'):
-                return {'success': False, 'error': 'Company not found'}
-            if company_id not in self.companies_db:
-                return {'success': False, 'error': 'Company not found'}
-            del self.companies_db[company_id]
-            return {'success': True}
+
+            # 5. Local in-memory fallback
+            if hasattr(self, 'companies_db') and company_id in self.companies_db:
+                del self.companies_db[company_id]
+                return {'success': True}
+
+            return {'success': False, 'error': 'Company not found'}
         except Exception as e:
             print(f"Error deleting company: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def delete_company_by_name(self, name: str) -> Dict:
+        """Delete a company/HTE profile by name (case-insensitive) from both collections."""
+        needle = (name or '').strip().lower()
+        if not needle:
+            return {'success': False, 'error': 'Name is required'}
+        try:
+            deleted = False
+            if self.db:
+                for collection in ('companies', 'hte_profiles'):
+                    for doc in self.db.collection(collection).get():
+                        d = doc.to_dict()
+                        stored = (d.get('name') or '').strip().lower()
+                        if stored == needle:
+                            self.db.collection(collection).document(doc.id).delete()
+                            deleted = True
+                            print(f"[delete_company_by_name] Deleted '{name}' from {collection}: {doc.id}")
+                            # Keep scanning — could exist in both collections
+            if deleted:
+                return {'success': True}
+            return {'success': False, 'error': f'No company named "{name}" found'}
+        except Exception as e:
+            print(f"Error deleting company by name: {e}")
             return {'success': False, 'error': str(e)}
 
     # Evaluation Methods
@@ -2951,11 +3034,72 @@ class FirebaseService:
     # Auto-Matching Logic
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _auto_assign_adviser(self, student_id: str) -> None:
+    def _auto_assign_supervisor(self, student_id: str, hte_id: str = None, hte: Dict = None) -> None:
         """
-        Automatically assign the least-loaded active adviser to a student.
+        Automatically assign a supervisor to a student based on the assigned HTE.
+        Uses the supervisor field from the HTE profile or company record.
+        Skips if the student already has a supervisor assigned.
+        """
+        # Skip if student already has a supervisor
+        student = self.get_user(student_id)
+        if not student:
+            return
+        if student.get('supervisorId') or student.get('supervisorName'):
+            print(f"[auto-supervisor] Student {student_id} already has supervisor — skipping")
+            return
+
+        # Get HTE data if not provided
+        if not hte:
+            if hte_id:
+                hte = self.get_hte_profile(hte_id)
+                if not hte:
+                    hte = self.get_company(hte_id)
+            if not hte:
+                print(f"[auto-supervisor] No HTE found for student {student_id}")
+                return
+
+        # Get supervisor from HTE
+        supervisor_name = (hte.get('supervisor') or
+                          hte.get('contactPerson') or
+                          hte.get('supervisorName') or '').strip()
+
+        if not supervisor_name:
+            print(f"[auto-supervisor] No supervisor found in HTE '{hte.get('name')}' for student {student_id}")
+            return
+
+        # Find the supervisor user record
+        supervisor = None
+        try:
+            if self.db:
+                for doc in self.db.collection('users').where('role', '==', 'supervisor').get():
+                    d = doc.to_dict()
+                    d['id'] = doc.id
+                    if d.get('name', '').strip().lower() == supervisor_name.strip().lower():
+                        supervisor = d
+                        break
+            else:
+                for u in (self.users_db or {}).values():
+                    if u.get('role') == 'supervisor' and u.get('name', '').strip().lower() == supervisor_name.strip().lower():
+                        supervisor = dict(u)
+                        break
+        except Exception as e:
+            print(f"[auto-supervisor] Error finding supervisor by name: {e}")
+
+        if supervisor:
+            print(f"[auto-supervisor] Assigning HTE supervisor {supervisor.get('name')} to student {student_id}")
+            self.update_user(student_id, {
+                'supervisorId':   supervisor.get('id'),
+                'supervisorName': supervisor.get('name'),
+            })
+        else:
+            print(f"[auto-supervisor] Supervisor '{supervisor_name}' not found in users for student {student_id}")
+
+    def _auto_assign_adviser(self, student_id: str, hte_id: str = None) -> None:
+        """
+        Automatically assign an adviser to a student.
+        If hte_id is provided, use the adviser assigned to that HTE company.
+        Otherwise, fall back to load-balancing (least-loaded active adviser).
         Skips if the student already has an adviser assigned.
-        Load is measured by how many students currently have adviserId == adviser.id.
         """
         # Skip if student already has an adviser
         student = self.get_user(student_id)
@@ -2965,6 +3109,47 @@ class FirebaseService:
             print(f"[auto-adviser] Student {student_id} already has adviser — skipping")
             return
 
+        # Try to get adviser from the assigned HTE
+        if hte_id:
+            hte = self.get_hte_profile(hte_id)
+            if not hte:
+                hte = self.get_company(hte_id)
+            
+            if hte:
+                # Check if HTE has an assigned adviser
+                adviser_name = hte.get('adviser') or hte.get('adviserName') or hte.get('assignedAdviser')
+                adviser_id = hte.get('adviserId') or hte.get('assignedAdviserId')
+                
+                if adviser_name:
+                    # Find the adviser user record
+                    adviser = None
+                    try:
+                        if self.db:
+                            for doc in self.db.collection('users').where('role', '==', 'adviser').get():
+                                d = doc.to_dict()
+                                d['id'] = doc.id
+                                if d.get('name', '').strip().lower() == adviser_name.strip().lower():
+                                    adviser = d
+                                    break
+                        else:
+                            for u in (self.users_db or {}).values():
+                                if u.get('role') == 'adviser' and u.get('name', '').strip().lower() == adviser_name.strip().lower():
+                                    adviser = dict(u)
+                                    break
+                    except Exception as e:
+                        print(f"[auto-adviser] Error finding adviser by name: {e}")
+                    
+                    if adviser:
+                        print(f"[auto-adviser] Assigning HTE adviser {adviser.get('name')} to student {student_id}")
+                        self.update_user(student_id, {
+                            'adviserId':   adviser.get('id', adviser_id),
+                            'adviserName': adviser.get('name', adviser_name),
+                        })
+                        return
+                    else:
+                        print(f"[auto-adviser] HTE adviser '{adviser_name}' not found in users, falling back to load-balancing")
+
+        # Fallback: load-balanced adviser assignment
         # Fetch all advisers
         advisers: List[Dict] = []
         try:
@@ -3005,7 +3190,7 @@ class FirebaseService:
 
         # Pick the adviser with the minimum load
         best_adviser = min(advisers, key=lambda a: load.get(a['id'], 0))
-        print(f"[auto-adviser] Assigning {best_adviser.get('name')} (load={load.get(best_adviser['id'], 0)}) to student {student_id}")
+        print(f"[auto-adviser] Assigning load-balanced adviser {best_adviser.get('name')} (load={load.get(best_adviser['id'], 0)}) to student {student_id}")
 
         self.update_user(student_id, {
             'adviserId':   best_adviser['id'],
@@ -3329,6 +3514,15 @@ class FirebaseService:
 
             updated_plan = plan_result['plan']
 
+            # ── Get supervisor and adviser info for the plan response ───────
+            supervisor_name = hte.get('supervisor') or hte.get('contactPerson') or ''
+            adviser_name = hte.get('adviser') or ''
+
+            if supervisor_name:
+                updated_plan['supervisorName'] = supervisor_name
+            if adviser_name:
+                updated_plan['adviserName'] = adviser_name
+
             # ── Sync company assignment to the student's user record ───────
             student_id = updated_plan.get('studentId', '')
             if student_id:
@@ -3342,10 +3536,17 @@ class FirebaseService:
                     # Non-fatal: plan is already assigned; log and continue
                     print(f"[assign] Warning: could not update user companyId: {e}")
 
-            # ── Auto-assign an adviser (load-balanced: fewest students first) ─
+            # ── Auto-assign a supervisor (use HTE's supervisor if available) ─
             if student_id:
                 try:
-                    self._auto_assign_adviser(student_id)
+                    self._auto_assign_supervisor(student_id, hte_id=hte_id, hte=hte)
+                except Exception as se:
+                    print(f"[assign] Warning: auto supervisor assignment failed: {se}")
+
+            # ── Auto-assign an adviser (use HTE's adviser if available, otherwise load-balanced) ─
+            if student_id:
+                try:
+                    self._auto_assign_adviser(student_id, hte_id=hte_id)
                 except Exception as ae:
                     print(f"[assign] Warning: auto adviser assignment failed: {ae}")
 

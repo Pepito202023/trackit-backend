@@ -213,11 +213,11 @@ def _deliver(server, to: str, subject: str, html_body: str) -> bool:
     msg.attach(MIMEText(html_body, 'html', 'utf-8'))
     try:
         server.sendmail(email_from, [to], msg.as_string())
-        print(f"[Email] ✓ Sent to {to}: {subject}")
+        print(f"[Email] [OK] Sent to {to}: {subject}")
         return True
     except smtplib.SMTPRecipientsRefused as e:
         _set_error(f'Recipient refused: {to}')
-        print(f"[Email] ✗ Recipient refused: {to}. Error: {e}")
+        print(f"[Email] [FAIL] Recipient refused: {to}. Error: {e}")
         return False
     except Exception as e:
         _set_error(f'Failed to send to {to}: {type(e).__name__}: {e}')

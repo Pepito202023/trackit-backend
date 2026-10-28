@@ -538,7 +538,7 @@ def google_login():
     )
     # Password is already stripped by get_all_users() — remove defensively anyway
     matched_user.pop('password', None)
-    print(f"[Google Login] ✓ {google_email} ({effective_role}) signed in via Google")
+    print(f"[Google Login] [OK] {google_email} ({effective_role}) signed in via Google")
     return jsonify({
         'success': True,
         'token': access_token,
@@ -664,7 +664,7 @@ def google_login_code():
         additional_claims={'role': effective_role},
     )
     matched_user.pop('password', None)
-    print(f"[Google Login Code] ✓ {verified_email} ({effective_role}) signed in")
+    print(f"[Google Login Code] [OK] {verified_email} ({effective_role}) signed in")
     return jsonify({'success': True, 'token': jwt_token, 'user': matched_user}), 200
 
 
@@ -763,7 +763,7 @@ def google_login_email():
         additional_claims={'role': effective_role},
     )
     matched_user.pop('password', None)
-    print(f"[Google Login Email] ✓ {verified_email} ({effective_role}) signed in via OAuth2 popup")
+    print(f"[Google Login Email] [OK] {verified_email} ({effective_role}) signed in via OAuth2 popup")
     return jsonify({'success': True, 'token': access_token_jwt, 'user': matched_user}), 200
 
 

@@ -181,6 +181,30 @@ def health_check():
         'service': 'TrackIt API'
     })
 
+
+# ── Keep-alive: ping self every 14 minutes to prevent Render free-tier sleep ──
+def _start_keepalive():
+    """Ping /api/health every 14 minutes so Render never idles."""
+    import threading, time, urllib.request, os as _os
+    def _ping():
+        # Give the server 20s to fully start before first ping
+        time.sleep(20)
+        base = _os.environ.get('RENDER_EXTERNAL_URL', '').rstrip('/')
+        if not base:
+            return  # not on Render — skip
+        url = f"{base}/api/health"
+        while True:
+            try:
+                urllib.request.urlopen(url, timeout=10)
+                print(f"[keep-alive] pinged {url}")
+            except Exception as e:
+                print(f"[keep-alive] ping failed: {e}")
+            time.sleep(14 * 60)   # 14 minutes
+    t = threading.Thread(target=_ping, daemon=True)
+    t.start()
+
+_start_keepalive()
+
 # Serve uploaded files
 @app.route('/uploads/<path:filename>', methods=['GET'])
 def serve_upload(filename):

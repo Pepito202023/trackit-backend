@@ -38,9 +38,9 @@ for doc in docs:
     print(f"  Found doc id={doc.id!r}  name={current_name!r}  role={data.get('role')!r}")
     if current_name != CORRECT_NAME:
         doc.reference.update({'name': CORRECT_NAME})
-        print(f"  ✓ Updated name: {current_name!r} → {CORRECT_NAME!r}")
+        print(f"  [OK] Updated name: {current_name!r} → {CORRECT_NAME!r}")
     else:
-        print(f"  ✓ Name is already correct, no change needed.")
+        print(f"  [OK] Name is already correct, no change needed.")
     found += 1
 
 if found == 0:
@@ -55,9 +55,9 @@ if found == 0:
             print(f"  Found doc id={doc.id!r}  name={current_name!r}  role={data.get('role')!r}")
             if current_name != CORRECT_NAME:
                 doc.reference.update({'name': CORRECT_NAME})
-                print(f"  ✓ Updated name: {current_name!r} → {CORRECT_NAME!r}")
+                print(f"  [OK] Updated name: {current_name!r} → {CORRECT_NAME!r}")
             else:
-                print(f"  ✓ Name is already correct.")
+                print(f"  [OK] Name is already correct.")
             found += 1
 
 if found == 0:

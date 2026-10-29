@@ -12,7 +12,7 @@ services:
       - key: GOOGLE_CLIENT_ID
         value: 801818179102-k8urb95atjb6rsqm8mtpgnpsl7qq2tba.apps.googleusercontent.com
       - key: TRACKIT_WEB_URL
-        value: https://login-system-292a0.web.app
+        value: https://webadmin-lac.vercel.app
       # Set these manually in the Render dashboard:
       # FIREBASE_SERVICE_ACCOUNT_JSON  — paste the full serviceAccountKey JSON as one line
       # TRACKIT_EMAIL_FROM             — your Gmail address

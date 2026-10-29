@@ -1,0 +1,65 @@
+# This file specifies files that are intentionally ignored by Google Cloud Build
+# when deploying from source
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.hypothesis/
+.coverage
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+docs/
+
+# Tests
+tests/
+test_*.py
+
+# Scripts
+scripts/
+tools/
+
+# Temporary files
+nul
+tunnel_url.txt
+LOCAL_SERVER_IP.txt
+
+# Exclude Firebase service account key from container (use env var instead)
+serviceAccountKey.json
+services/*.json
+
+# Render configuration (not needed for Cloud Run)
+render.yaml
+Procfile
+runtime.txt

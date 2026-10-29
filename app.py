@@ -237,7 +237,7 @@ def health_check():
 
 # ── Keep-alive: ping self every 10 minutes to prevent Render free-tier sleep ──
 def _start_keepalive():
-    """Ping /api/health every 10 minutes so Render never idles."""
+    """Ping /api/health every 5 minutes so Render stays awake."""
     import threading, time, urllib.request, os as _os
     def _ping():
         # Give the server 20s to fully start before first ping
@@ -252,7 +252,7 @@ def _start_keepalive():
                 print(f"[keep-alive] pinged {url}")
             except Exception as e:
                 print(f"[keep-alive] ping failed: {e}")
-            time.sleep(10 * 60)   # 10 minutes (more frequent)
+            time.sleep(5 * 60)   # 5 minutes (more frequent to prevent sleep)
     t = threading.Thread(target=_ping, daemon=True)
     t.start()
 

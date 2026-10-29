@@ -181,31 +181,28 @@ def create_user():
             except Exception:
                 pass
 
-        # Send welcome email asynchronously so SMTP latency doesn't block the response
+        # Send welcome email synchronously — Gunicorn timeout is 120s which is
+        # more than enough for SMTP. Daemon threads get killed by Gunicorn when
+        # the request finishes, so we must send in-request.
         email_sent = False
         email_error = None
         if is_temp:
-            import threading
             user_payload = {**user, 'idNumber': id_number or user.get('idNumber', '')}
             user_id = user.get('id', '')
-
-            def _send_bg(payload, pw, uid, svc_ref):
-                ok = send_welcome_email(payload, pw)
-                print(f"[CREATE] Email to {payload.get('email','?')}: {'OK' if ok else 'FAILED'}")
-                if uid:
-                    try:
-                        svc_ref.update_user(uid, {
-                            '_tempPw': pw,
-                            '_emailSent': ok,
-                        })
-                    except Exception:
-                        pass
-
-            t = threading.Thread(target=_send_bg, args=(user_payload, password, user_id, svc), daemon=True)
-            t.start()
-            t.join(timeout=5)  # wait up to 5s for quick connects
-            # Optimistically report sent — frontend can retry if needed
-            email_sent = True
+            try:
+                email_sent = send_welcome_email(user_payload, password)
+                if not email_sent:
+                    email_error = last_email_error() or 'Email send failed'
+                else:
+                    # Mark email as sent on the user record
+                    if user_id:
+                        try:
+                            svc.update_user(user_id, {'_emailSent': True})
+                        except Exception:
+                            pass
+            except Exception as mail_err:
+                email_error = str(mail_err)
+                print(f"[CREATE] Email error: {mail_err}")
 
         user.pop('password', None)
         response = {**user, 'emailSent': email_sent}

@@ -171,6 +171,59 @@ def institution_branding():
     }), 200
 
 
+# ── Email test endpoint (coordinator only) ───────────────────────────────────
+@app.route('/api/test-email', methods=['POST'])
+@jwt_required()
+def test_email():
+    """
+    POST /api/test-email  { "to": "recipient@gmail.com" }
+    Sends a test email to verify SMTP is working on this deployment.
+    Coordinator/chairman only.
+    """
+    from flask_jwt_extended import get_jwt_identity
+    from services.email_service import _get_email_config, _open_smtp, _deliver, _base_html
+    import smtplib
+
+    current_user_id = get_jwt_identity()
+    caller = firebase_service.get_user(current_user_id)
+    if not caller:
+        return jsonify({'error': 'Unauthorized'}), 403
+    role = (caller.get('role') or '').lower().strip()
+    role = {'admin': 'coordinator', 'employee': 'adviser'}.get(role, role)
+    if role not in ('coordinator', 'chairman'):
+        return jsonify({'error': 'Only coordinators can send test emails'}), 403
+
+    data = request.get_json() or {}
+    to = (data.get('to') or caller.get('email') or '').strip()
+    if not to:
+        return jsonify({'error': 'No recipient email address'}), 400
+
+    ef, ep, _ = _get_email_config()
+    if not ef or not ep:
+        return jsonify({'error': 'TRACKIT_EMAIL_FROM and TRACKIT_EMAIL_PASSWORD not set in environment'}), 500
+
+    body_html = _base_html('TrackIt Email Test', f"""
+<p>This is a test email from your TrackIt deployment.</p>
+<p><strong>SMTP is working correctly.</strong></p>
+<p>Sent to: {to}</p>
+<p style="color:#666;font-size:0.9rem">If you received this, email delivery is configured correctly on your server.</p>
+""")
+    try:
+        server = _open_smtp()
+        if not server:
+            from services.email_service import last_email_error
+            return jsonify({'success': False, 'error': last_email_error() or 'SMTP connection failed'}), 500
+        ok = _deliver(server, to, 'TrackIt — Email Test', body_html)
+        try: server.quit()
+        except: pass
+        if ok:
+            return jsonify({'success': True, 'message': f'Test email sent to {to}'}), 200
+        from services.email_service import last_email_error
+        return jsonify({'success': False, 'error': last_email_error() or 'Send failed'}), 500
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 # Health Check
 @app.route('/api/health', methods=['GET'])
 def health_check():

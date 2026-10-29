@@ -25,10 +25,10 @@ from pathlib import Path
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
-SMTP_HOST = 'smtp.gmail.com'
-SMTP_SSL_PORT = 465       # Gmail SSL — faster and more reliable than STARTTLS 587
+SMTP_HOST         = 'smtp.gmail.com'
+SMTP_SSL_PORT     = 465       # Gmail SSL — faster and more reliable than STARTTLS 587
 SMTP_STARTTLS_PORT = 587
-SMTP_TIMEOUT = 60         # Gmail STARTTLS on this network can take 40s+; 15s was too low
+SMTP_TIMEOUT      = 30        # 30s is enough; Render's network is fast
 
 _LAST_ERROR = None
 

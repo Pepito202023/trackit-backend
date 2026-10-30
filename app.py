@@ -37,8 +37,9 @@ from services.firebase_service import FirebaseService
 app = Flask(__name__)
 
 # Configuration
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'trackit-secret-key-2024')
-app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'trackit-jwt-secret-2024')
+# Use longer, more secure secrets for production (32+ bytes for SHA256)
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'trackit-secret-key-2024-secure-production-key-32bytes')
+app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'trackit-jwt-secret-2024-secure-production-key-32bytes')
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 

@@ -151,6 +151,7 @@ def create_company():
     adviser = data.get('adviser', '').strip()
     adviser_id = data.get('adviserId', '').strip()
     required_skills = data.get('requiredSkills', [])
+    intern_capacity = int(data.get('internCapacity', 0) or 0)
 
     if not name:
         return jsonify({'error': 'Company name is required'}), 400
@@ -169,6 +170,9 @@ def create_company():
         'adviser': adviser,
         'adviserId': adviser_id,
         'requiredSkills': required_skills,
+        'internCapacity': intern_capacity,
+        'totalSlots': intern_capacity,
+        'availableSlots': intern_capacity,
     })
 
     if result.get('success'):

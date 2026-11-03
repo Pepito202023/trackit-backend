@@ -153,15 +153,18 @@ def _parse_request():
     if request.content_type and 'multipart/form-data' in request.content_type:
         lat = request.form.get('latitude', '').strip()
         lng = request.form.get('longitude', '').strip()
+        acc = request.form.get('accuracy', '').strip()
         return {
             'latitude':         float(lat) if lat else None,
             'longitude':        float(lng) if lng else None,
+            'accuracy':         float(acc) if acc else None,
             'address':          request.form.get('address'),
             'faceVerified':     request.form.get('faceVerified', 'false').lower() == 'true',
             'livenessVerified': request.form.get('livenessVerified', 'false').lower() == 'true',
             'locationDisabled': request.form.get('locationDisabled', 'false').lower() == 'true',
             'facePhoto':        request.files.get('facePhoto'),
             'facePhotoUrl':     request.form.get('facePhotoUrl'),  # Firebase Storage URL
+            '_faceVerifiedPresent': 'faceVerified' in request.form,
         }
     else:
         data = request.get_json() or {}
@@ -169,12 +172,14 @@ def _parse_request():
         return {
             'latitude':         location.get('latitude'),
             'longitude':        location.get('longitude'),
+            'accuracy':         location.get('accuracy'),
             'address':          location.get('address'),
             'faceVerified':     data.get('faceVerified', False),
             'livenessVerified': data.get('livenessVerified', False),
             'locationDisabled': data.get('locationDisabled', False),
             'facePhoto':        None,
             'facePhotoUrl':     data.get('facePhotoUrl'),
+            '_faceVerifiedPresent': 'faceVerified' in data,
         }
 
 
@@ -267,14 +272,22 @@ def record_checkin():
     face_photo_file   = parsed['facePhoto']
     face_photo_url_override = parsed.get('facePhotoUrl')  # Firebase Storage URL
     face_photo_url = _resolve_face_photo_url(parsed, current_user_id, 'checkin')
+    accuracy          = parsed.get('accuracy')
 
     print(f"[CHECK-IN] user={current_user_id} lat={latitude} lng={longitude} "
           f"face={face_verified} liveness={liveness_verified} "
           f"loc_disabled={location_disabled} has_photo={face_photo_file is not None} "
           f"storage_url={bool(face_photo_url_override)} saved_url={bool(face_photo_url)}")
 
-    if not location_disabled and (latitude is None or longitude is None):
-        return jsonify({'error': 'Location is required. Enable GPS or tap Skip GPS.'}), 400
+    # face_verified key must be present — absence means the client skipped face verification
+    if not parsed.get('_faceVerifiedPresent', True):
+        return jsonify({'error': 'face_verified field is required. Face verification must be completed before check-in.'}), 403
+
+    if not location_disabled and (
+        latitude is None or longitude is None or
+        (latitude == 0.0 and longitude == 0.0)
+    ):
+        return jsonify({'error': 'Valid non-zero GPS coordinates are required for check-in.'}), 400
     if not face_verified:
         return jsonify({'error': 'Face verification required. Please retake your photo.'}), 400
     if not liveness_verified:
@@ -310,6 +323,7 @@ def record_checkin():
             'latitude':  latitude,
             'longitude': longitude,
             'address':   address,
+            'accuracy':  accuracy,
         },
         'faceVerified':        face_verified,
         'livenessVerified':    liveness_verified,
@@ -365,6 +379,7 @@ def record_checkin():
             'latitude':  latitude,
             'longitude': longitude,
             'address':   address,
+            'accuracy':  accuracy,
         },
         'faceVerified':        face_verified,
         'livenessVerified':    liveness_verified,
@@ -408,9 +423,17 @@ def record_checkout():
     face_verified     = parsed['faceVerified']
     location_disabled = parsed['locationDisabled']
     face_photo_url = _resolve_face_photo_url(parsed, current_user_id, 'checkout')
+    accuracy          = parsed.get('accuracy')
 
-    if not location_disabled and (latitude is None or longitude is None):
-        return jsonify({'error': 'Location is required. Enable GPS or tap Skip GPS.'}), 400
+    # face_verified key must be present
+    if not parsed.get('_faceVerifiedPresent', True):
+        return jsonify({'error': 'face_verified field is required. Face verification must be completed before check-out.'}), 403
+
+    if not location_disabled and (
+        latitude is None or longitude is None or
+        (latitude == 0.0 and longitude == 0.0)
+    ):
+        return jsonify({'error': 'Valid non-zero GPS coordinates are required for check-out.'}), 400
     if not face_verified:
         return jsonify({'error': 'Face verification required. Please retake your photo.'}), 400
 
@@ -445,6 +468,7 @@ def record_checkout():
         'latitude':  latitude,
         'longitude': longitude,
         'address':   address,
+        'accuracy':  accuracy,
     }
     if face_photo_url:
         entry['checkOutFacePhotoUrl'] = face_photo_url
@@ -475,6 +499,7 @@ def record_checkout():
             'latitude':  latitude,
             'longitude': longitude,
             'address':   address,
+            'accuracy':  accuracy,
         },
         'checkOutFaceVerified': face_verified,
         'locationDisabled':     location_disabled,

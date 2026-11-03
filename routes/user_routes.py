@@ -646,7 +646,10 @@ def import_users():
                     update_fields['email'] = email
                 if department:
                     update_fields['department'] = department
-                if company:
+                # Only update company for non-student roles via import.
+                # Students' company is set exclusively by the assignment flow.
+                existing_role = _effective_role(existing_user.get('role', ''))
+                if company and existing_role != 'student':
                     update_fields['company'] = company
                 if id_number:
                     update_fields['idNumber'] = id_number
@@ -676,9 +679,11 @@ def import_users():
                            else generate_temp_password())
 
                 if id_number:
+                    # Students' company is set only via the assignment flow.
+                    create_company = company if role != 'student' else ''
                     result = svc.create_user_by_id(
                         id_number, temp_pw, name, role,
-                        department or None, email or None, company or None
+                        department or None, email or None, create_company or None
                     )
                 else:
                     result = svc.create_user(email, temp_pw, name, role, department or None)
@@ -816,6 +821,16 @@ def update_user(user_id):
     if not update_data:
         return jsonify({'error': 'No valid fields to update'}), 400
 
+    # Guard: look up the target user to apply role-based field restrictions.
+    target = svc.get_user(user_id)
+    if target is None:
+        return jsonify({'error': 'User not found'}), 404
+    if _effective_role(target.get('role', '')) == 'student':
+        caller_role = _current_user_role(svc)
+        if caller_role not in ('coordinator', 'chairman'):
+            for _f in ('adviserId', 'adviserName', 'supervisorId', 'supervisorName', 'company'):
+                update_data.pop(_f, None)
+
     result = svc.update_user(user_id, update_data)
 
     if result.get('success'):
@@ -878,6 +893,20 @@ def unassign_student(user_id):
 
     result = svc.update_user(user_id, update_data)
     if result.get('success'):
+        # Also update application_plans status so Part A's guard is consistent.
+        try:
+            if svc.db:
+                assigned_plans = list(
+                    svc.db.collection('application_plans')
+                    .where('studentId', '==', user_id)
+                    .where('status', '==', 'assigned')
+                    .stream()
+                )
+                for plan_doc in assigned_plans:
+                    plan_doc.reference.update({'status': 'unassigned'})
+        except Exception as e:
+            print(f"[unassign_student] Could not update plan status for {user_id}: {e}")
+            # Non-fatal: user document fields are already cleared.
         return jsonify({'success': True, 'message': 'Student unassigned successfully'}), 200
     return jsonify({'error': result.get('error', 'Failed to unassign student')}), 400
 

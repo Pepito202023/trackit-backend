@@ -21,6 +21,16 @@ ADMIN_ROLES = {'coordinator', 'adviser', 'supervisor', 'chairman'}
 STUDENT_ROLES = {'student'}
 ALL_ROLES = ADMIN_ROLES | STUDENT_ROLES
 
+# Role alias normalisation (do NOT import from firebase_service — it's a class attribute)
+_ROLE_ALIASES = {'admin': 'coordinator', 'employee': 'adviser'}
+
+# Assignment fields that must not be exposed when no approved plan exists
+_ASSIGNMENT_FIELDS = (
+    'adviserId', 'adviserName',
+    'supervisorId', 'supervisorName',
+    'companyId', 'companyName', 'company',
+)
+
 # ── Password-reset rate limiting (in-memory) ────────────────────────────────
 # {email: [unix_timestamps]} — allows max 1 request per 60s, 3 per hour
 _reset_rate_log: dict = {}
@@ -281,12 +291,27 @@ def get_current_user():
     current_user_id = get_jwt_identity()
 
     user = svc.get_user(current_user_id)
-    if user:
-        # Never send the password hash to the browser
-        user.pop('password', None)
-        return jsonify(user), 200
-    else:
+    if not user:
         return jsonify({'error': 'User not found'}), 404
+
+    # Never send the password hash to the browser
+    user.pop('password', None)
+
+    # For students: only expose assignment fields when an approved plan exists.
+    # This is a presentation-layer filter — it does not mutate Firestore.
+    # The authoritative operations (assign_student_to_hte, unassign_student,
+    # cleanup script) write/clear the user document directly.
+    raw_role = (user.get('role') or '').lower()
+    effective_role = _ROLE_ALIASES.get(raw_role, raw_role)
+    if effective_role == 'student':
+        plans = svc.get_application_plans(
+            student_id=current_user_id, status='assigned'
+        )
+        if not plans:
+            for field in _ASSIGNMENT_FIELDS:
+                user[field] = None
+
+    return jsonify(user), 200
 
 
 @auth_bp.route('/change-password', methods=['POST'])

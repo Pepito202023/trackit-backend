@@ -589,7 +589,9 @@ class FirebaseService:
                     user_data['department'] = department
                 if email:
                     user_data['email'] = email
-                if company:
+                # Students' company is set exclusively by the assignment flow.
+                # Only write company for non-student roles (advisers, supervisors, etc.).
+                if company and role != 'student':
                     user_data['company'] = company
                 
                 doc_ref = self.db.collection('users').add(user_data)
@@ -624,10 +626,9 @@ class FirebaseService:
                     new_user['department'] = department
                 if email:
                     new_user['email'] = email
-                if company:
+                # Students' company is set exclusively by the assignment flow.
+                if company and role != 'student':
                     new_user['company'] = company
-                
-                self.users_db[user_id] = new_user
                 self._save_users_to_file()
                 safe = dict(new_user)
                 safe.pop('password', None)

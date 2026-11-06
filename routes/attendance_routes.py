@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 from services.firebase_service import FirebaseService
 import os
 import uuid
+import uuid as _uuid
+import urllib.parse as _urllib_parse
 
 attendance_bp = Blueprint('attendance', __name__)
 
@@ -27,8 +29,16 @@ def _upload_to_firebase_storage(image_bytes: bytes, destination_path: str):
         bucket = storage.bucket()
         blob = bucket.blob(destination_path)
         blob.upload_from_string(image_bytes, content_type='image/jpeg')
-        blob.make_public()
-        return blob.public_url
+        token = str(_uuid.uuid4())
+        blob.metadata = {'firebaseStorageDownloadTokens': token}
+        blob.patch()
+        download_url = (
+            f"https://firebasestorage.googleapis.com/v0/b/{bucket.name}"
+            f"/o/{_urllib_parse.quote(destination_path, safe='')}"
+            f"?alt=media&token={token}"
+        )
+        print(f"[Storage] Uploaded {destination_path} → {download_url}")
+        return download_url
     except Exception as e:
         print(f"[ERROR] Firebase Storage upload failed for {destination_path}: {e}")
         return None
@@ -65,6 +75,7 @@ def _read_upload_bytes(file_storage):
 def _save_face_photo_bytes(image_bytes: bytes, user_id: str, event: str, filename_hint: str = 'photo.jpg'):
     """
     Upload face photo to Firebase Storage; return the public download URL.
+    Falls back to a base64 data URL so the photo is never silently lost.
     """
     if not image_bytes:
         return None
@@ -79,8 +90,16 @@ def _save_face_photo_bytes(image_bytes: bytes, user_id: str, event: str, filenam
         print(f"[OK] Face photo uploaded to Firebase Storage: {url}")
         return url
 
-    print(f"[ERROR] Could not upload face photo to Firebase Storage")
-    return None
+    # Firebase Storage upload failed (missing service account permissions or
+    # bucket not configured on this deployment). Fall back to a base64 data URL
+    # so the photo still shows in the web admin dashboard.
+    print(f"[WARN] Firebase Storage upload failed — using base64 data URL fallback")
+    import base64 as _b64
+    mime = 'image/jpeg' if ext in ('.jpg', '.jpeg') else f'image/{ext.lstrip(".")}'
+    b64 = _b64.b64encode(image_bytes).decode('utf-8')
+    data_url = f"data:{mime};base64,{b64}"
+    print(f"[OK] Face photo stored as base64 data URL ({len(data_url)} chars)")
+    return data_url
 
 
 def _save_face_photo(file_storage, user_id: str, event: str):
@@ -293,7 +312,10 @@ def record_checkin():
     if not liveness_verified:
         return jsonify({'error': 'Liveness check required. Please blink during capture.'}), 400
 
-    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    # Use Philippine Time (UTC+8) for the date field so records are stored
+    # under the local calendar date, not the UTC date.
+    PH_TZ_OFFSET = timedelta(hours=8)
+    today = (datetime.now(timezone.utc) + PH_TZ_OFFSET).strftime('%Y-%m-%d')
     now_iso = datetime.now(timezone.utc).isoformat()
 
     # ── Determine late status from OJT settings ───────────────────────────────

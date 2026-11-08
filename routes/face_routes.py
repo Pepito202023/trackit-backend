@@ -576,19 +576,18 @@ def verify_face():
     else:
         # ── Path A: 128-d face-api.js neural descriptor ──────────────────────
         # face-api.js uses Euclidean distance ≤ 0.6 as the standard threshold
-        # for same-person identification. We use 0.55 to be slightly stricter.
+        # for same-person identification. We use 0.52 to be stricter.
         desc_dist = None
         descriptor_ok = False
         if stored_descriptor and live_descriptor:
             desc_dist = _descriptor_distance(stored_descriptor, live_descriptor)
-            descriptor_ok = desc_dist <= 0.55
+            descriptor_ok = desc_dist <= 0.52
             confidence = max(0.0, 1.0 - (desc_dist / 0.6))
 
         # ── Path B: normalised landmark geometry (mean Euclidean distance) ──
         # The stored faceData has normalised {nx, ny} per landmark. Compare with
         # the live capture's normalised landmarks. Low distance = same person.
-        # Threshold: mean normalised distance ≤ 0.18 (empirically safe for
-        # same-person across different captures).
+        # Threshold: mean normalised distance ≤ 0.16 (tightened).
         landmark_ok = False
         lm_dist = None
         live_lm_data = None
@@ -596,7 +595,7 @@ def verify_face():
             live_lm_data = _extract_landmarks_from_mlkit(mlkit_dict)
         if stored_face_data and live_lm_data:
             lm_dist = _landmark_distance(stored_face_data, live_lm_data)
-            landmark_ok = lm_dist <= 0.18
+            landmark_ok = lm_dist <= 0.16
             lm_confidence = max(0.0, 1.0 - (lm_dist / 0.18))
             confidence = max(confidence, lm_confidence)
 
@@ -617,7 +616,7 @@ def verify_face():
             photo_score, gray_score = _image_match_score(
                 registered_photo, image_bytes, stored_face_data, mlkit_dict
             )
-            photo_ok = photo_score >= 0.32 and gray_score >= 0.22
+            photo_ok = photo_score >= 0.35 and gray_score >= 0.24
             if desc_dist is None and not landmark_ok:
                 confidence = max(confidence, photo_score)
 
@@ -629,9 +628,9 @@ def verify_face():
         # Near-pass: only if confidence is genuinely close
         if not verified and blink_verified:
             near_pass = (
-                (desc_dist is not None and desc_dist <= 0.65) or
-                (lm_dist is not None and lm_dist <= 0.22) or
-                (registered_photo is not None and photo_score >= 0.28 and gray_score >= 0.20)
+                (desc_dist is not None and desc_dist <= 0.58) or
+                (lm_dist is not None and lm_dist <= 0.19) or
+                (registered_photo is not None and photo_score >= 0.32 and gray_score >= 0.22)
             )
             if near_pass:
                 verified = True
@@ -676,4 +675,151 @@ def verify_face():
         'blinkVerified': blink_verified,
         'photoUrl':      photo_url,
         'message':       message,
+    }), 200
+
+
+# ── POST /api/face/verify-for-attendance ─────────────────────────────────────
+@face_bp.route('/verify-for-attendance', methods=['POST'])
+@jwt_required()
+def verify_face_for_attendance():
+    """
+    Strict face verification endpoint used immediately before check-in / check-out.
+
+    Uses stricter thresholds than /api/face/verify and intentionally has NO
+    blink near-pass bypass (blink bonus is informational only).
+
+    Strict thresholds:
+      - Descriptor distance  ≤ 0.50
+      - Landmark distance    ≤ 0.16
+      - Photo score          ≥ 0.38 AND gray_score ≥ 0.26
+
+    Returns 403 if the student has no registered face at all.
+    Returns { verified: bool, similarity: float, message: str, photoUrl: str }
+    """
+    current_user_id = get_jwt_identity()
+
+    svc = _get_service()
+    user = svc.get_user(current_user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    # Load stored face data
+    stored_face_data = user.get('faceData') if isinstance(user.get('faceData'), dict) else None
+    stored_descriptor = _parse_descriptor(user.get('faceDescriptor')) or _parse_descriptor(
+        (stored_face_data or {}).get('descriptor')
+    )
+
+    # Reject if student has no registered face at all
+    has_registration = bool(
+        user.get('facePhotoUrl') or user.get('faceDescriptor') or user.get('faceThumb')
+    )
+    if not has_registration:
+        return jsonify({
+            'error': 'No registered face found. Register your face in Profile before check-in.'
+        }), 403
+
+    # Parse blink_verified (informational only — no bypass here)
+    blink_verified = False
+    if request.content_type and 'multipart/form-data' in request.content_type:
+        blink_verified = request.form.get('blinkVerified', 'false').lower() == 'true'
+    else:
+        body = request.get_json(silent=True) or {}
+        blink_verified = bool(body.get('blinkVerified', False))
+
+    # Decode image
+    image_bytes = _decode_image(request)
+    if not image_bytes:
+        return jsonify({'error': 'Image is required'}), 400
+
+    # Save photo for audit
+    photo_url = _save_image(image_bytes, current_user_id, prefix='verify')
+
+    mlkit_dict = _parse_mlkit(request)
+    live_descriptor = _parse_descriptor((mlkit_dict or {}).get('descriptor'))
+
+    MATCH_MSG = 'Face does not match the registered intern. Only the registered face can check in.'
+    confidence = 0.0
+    verified = False
+    message = MATCH_MSG
+
+    # ── Path A: 128-d descriptor (STRICT: ≤ 0.50) ────────────────────────────
+    desc_dist = None
+    descriptor_ok = False
+    if stored_descriptor and live_descriptor:
+        desc_dist = _descriptor_distance(stored_descriptor, live_descriptor)
+        descriptor_ok = desc_dist <= 0.50
+        confidence = max(0.0, 1.0 - (desc_dist / 0.6))
+
+    # ── Path B: Landmark geometry (STRICT: ≤ 0.16) ───────────────────────────
+    landmark_ok = False
+    lm_dist = None
+    live_lm_data = None
+    if stored_face_data and mlkit_dict:
+        live_lm_data = _extract_landmarks_from_mlkit(mlkit_dict)
+    if stored_face_data and live_lm_data:
+        lm_dist = _landmark_distance(stored_face_data, live_lm_data)
+        landmark_ok = lm_dist <= 0.16
+        lm_confidence = max(0.0, 1.0 - (lm_dist / 0.16))
+        confidence = max(confidence, lm_confidence)
+
+    # ── Path C: Pixel/histogram photo comparison (STRICT: ≥ 0.38 AND ≥ 0.26) ─
+    photo_score = 0.0
+    gray_score = 0.0
+    photo_ok = False
+    registered_photo = _registered_image_bytes(user, current_user_id)
+    if not registered_photo and user.get('faceThumb'):
+        try:
+            registered_photo = base64.b64decode(user.get('faceThumb'))
+        except Exception:
+            registered_photo = None
+    if registered_photo:
+        photo_score, gray_score = _image_match_score(
+            registered_photo, image_bytes, stored_face_data, mlkit_dict
+        )
+        photo_ok = photo_score >= 0.38 and gray_score >= 0.26
+        if desc_dist is None and not landmark_ok:
+            confidence = max(confidence, photo_score)
+
+    # NO near-pass bypass for attendance — blink is informational only
+    verified = descriptor_ok or landmark_ok or photo_ok
+
+    if verified:
+        message = 'Identity verified'
+        confidence = min(1.0, max(confidence, photo_score, 0.6 if descriptor_ok else 0.0))
+    elif registered_photo is None and desc_dist is None and lm_dist is None:
+        message = (
+            'Could not load your registered face photo. '
+            'Open Profile, register your face again, then check in.'
+        )
+    else:
+        message = MATCH_MSG
+
+    print(
+        f"[FACE VERIFY-ATTENDANCE] user={current_user_id} "
+        f"desc_dist={desc_dist} lm_dist={lm_dist} "
+        f"photo={photo_score:.3f} gray={gray_score:.3f} "
+        f"blink={blink_verified} verified={verified}"
+    )
+
+    # Audit log
+    try:
+        attempt = {
+            'userId':        current_user_id,
+            'photoUrl':      photo_url,
+            'verified':      verified,
+            'confidence':    round(confidence, 4),
+            'blinkVerified': blink_verified,
+            'endpoint':      'verify-for-attendance',
+            'timestamp':     datetime.now(timezone.utc).isoformat(),
+        }
+        if svc.db:
+            svc.db.collection('face_verifications').add(attempt)
+    except Exception:
+        pass
+
+    return jsonify({
+        'verified':    verified,
+        'similarity':  round(confidence, 4),
+        'message':     message,
+        'photoUrl':    photo_url,
     }), 200

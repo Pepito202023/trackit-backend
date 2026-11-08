@@ -8,6 +8,7 @@ from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from datetime import datetime, timedelta, timezone
 from services.firebase_service import FirebaseService
+from routes.face_routes import _registered_image_bytes, _image_match_score, _parse_descriptor, _descriptor_distance
 import os
 import uuid
 import uuid as _uuid
@@ -267,6 +268,43 @@ def get_all_attendance_records():
             record['department'] = student.get('department', '')
         enriched_records.append(_absolutize_attendance_record(record))
 
+    # ── Recalculate late/present status using CURRENT OJT settings ────────────
+    # This corrects any records whose status was set when a supervisor had
+    # incorrectly changed the OJT start time. A per-student supervisor schedule
+    # overrides the global OJT settings.
+    try:
+        settings = svc.get_settings()
+        global_start = settings.get('ojtStartTime', '08:00')
+        global_threshold = int(settings.get('lateThreshold', 15))
+        for rec in enriched_records:
+            check_in = rec.get('checkIn')
+            if not check_in:
+                rec['status'] = 'absent'
+                continue
+            # Only recalculate present/late — do not touch 'absent'
+            if rec.get('status') == 'absent':
+                continue
+            try:
+                # Resolve per-student override, else fall back to global
+                stu = svc.get_user(rec.get('userId'))
+                start_time_str = (stu.get('ojtStartTime') if stu else None) or global_start
+                stu_threshold = stu.get('ojtLateThreshold') if stu else None
+                late_threshold = int(
+                    stu_threshold if stu_threshold is not None else global_threshold
+                )
+                start_h, start_m = map(int, start_time_str.split(':'))
+                from datetime import datetime as _dt
+                # Parse HH:MM or HH:MM:SS
+                time_part = str(check_in).strip()[:5]  # "HH:MM"
+                ci_h, ci_m = map(int, time_part.split(':'))
+                cutoff_total = start_h * 60 + start_m + late_threshold
+                checkin_total = ci_h * 60 + ci_m
+                rec['status'] = 'late' if checkin_total > cutoff_total else 'present'
+            except Exception:
+                pass  # leave status unchanged if time parse fails
+    except Exception as recalc_err:
+        print(f"[attendance/all] Status recalc skipped: {recalc_err}")
+
     return jsonify(enriched_records), 200
 
 
@@ -298,6 +336,35 @@ def record_checkin():
           f"loc_disabled={location_disabled} has_photo={face_photo_file is not None} "
           f"storage_url={bool(face_photo_url_override)} saved_url={bool(face_photo_url)}")
 
+    # ── Server-side face re-verification ─────────────────────────────────────
+    user_profile = svc.get_user(current_user_id)
+    has_registered_face = bool(
+        (user_profile or {}).get('facePhotoUrl') or
+        (user_profile or {}).get('faceDescriptor') or
+        (user_profile or {}).get('faceThumb')
+    ) if user_profile else False
+
+    if not has_registered_face:
+        return jsonify({
+            'error': 'No registered face found. Register your face in Profile before check-in.'
+        }), 403
+
+    if face_photo_file and user_profile:
+        photo_bytes_for_verify = _read_upload_bytes(face_photo_file)
+        if photo_bytes_for_verify:
+            registered_photo = _registered_image_bytes(user_profile, current_user_id)
+            if registered_photo:
+                photo_score, gray_score = _image_match_score(
+                    registered_photo, photo_bytes_for_verify, None, None
+                )
+                print(f"[CHECK-IN RE-VERIFY] user={current_user_id} "
+                      f"photo={photo_score:.3f} gray={gray_score:.3f}")
+                if photo_score < 0.30 and gray_score < 0.20:
+                    face_verified = False
+                    return jsonify({
+                        'error': 'Face verification failed. The submitted photo does not match your registered face.'
+                    }), 403
+
     # face_verified key must be present — absence means the client skipped face verification
     if not parsed.get('_faceVerifiedPresent', True):
         return jsonify({'error': 'face_verified field is required. Face verification must be completed before check-in.'}), 403
@@ -323,6 +390,16 @@ def record_checkin():
         settings       = svc.get_settings()
         start_time_str = settings.get('ojtStartTime', '08:00')   # e.g. "08:00"
         late_threshold = int(settings.get('lateThreshold', 15))  # minutes
+        # Per-student supervisor schedule overrides the global OJT settings
+        student = svc.get_user(current_user_id)
+        if student:
+            if student.get('ojtStartTime'):
+                start_time_str = student['ojtStartTime']
+            if student.get('ojtLateThreshold') is not None:
+                try:
+                    late_threshold = int(student['ojtLateThreshold'])
+                except Exception:
+                    pass
         # Parse start time in the server's local timezone
         start_h, start_m = map(int, start_time_str.split(':'))
         now_local = datetime.now()
@@ -444,8 +521,38 @@ def record_checkout():
     address           = parsed['address']
     face_verified     = parsed['faceVerified']
     location_disabled = parsed['locationDisabled']
+    face_photo_file   = parsed['facePhoto']
     face_photo_url = _resolve_face_photo_url(parsed, current_user_id, 'checkout')
     accuracy          = parsed.get('accuracy')
+
+    # ── Server-side face re-verification ─────────────────────────────────────
+    user_profile = svc.get_user(current_user_id)
+    has_registered_face = bool(
+        (user_profile or {}).get('facePhotoUrl') or
+        (user_profile or {}).get('faceDescriptor') or
+        (user_profile or {}).get('faceThumb')
+    ) if user_profile else False
+
+    if not has_registered_face:
+        return jsonify({
+            'error': 'No registered face found. Register your face in Profile before check-in.'
+        }), 403
+
+    if face_photo_file and user_profile:
+        photo_bytes_for_verify = _read_upload_bytes(face_photo_file)
+        if photo_bytes_for_verify:
+            registered_photo = _registered_image_bytes(user_profile, current_user_id)
+            if registered_photo:
+                photo_score, gray_score = _image_match_score(
+                    registered_photo, photo_bytes_for_verify, None, None
+                )
+                print(f"[CHECK-OUT RE-VERIFY] user={current_user_id} "
+                      f"photo={photo_score:.3f} gray={gray_score:.3f}")
+                if photo_score < 0.30 and gray_score < 0.20:
+                    face_verified = False
+                    return jsonify({
+                        'error': 'Face verification failed. The submitted photo does not match your registered face.'
+                    }), 403
 
     # face_verified key must be present
     if not parsed.get('_faceVerifiedPresent', True):
@@ -714,3 +821,51 @@ def get_attendance_record(record_id):
     if record.get('userId') != current_user_id:
         return jsonify({'error': 'Unauthorized'}), 403
     return jsonify(record), 200
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DELETE ATTENDANCE RECORD  DELETE /api/attendance/<record_id>
+# Allows coordinators, chairmen, advisers, and supervisors to delete
+# an attendance record from the DTR.
+# ─────────────────────────────────────────────────────────────────────────────
+@attendance_bp.route('/<record_id>', methods=['DELETE'])
+@jwt_required()
+def delete_attendance_record_by_id(record_id):
+    """
+    DELETE /api/attendance/<record_id>
+    Deletes a specific attendance record.
+    Allowed roles: coordinator, chairman, adviser, supervisor.
+    """
+    svc = _get_service()
+    current_user_id = get_jwt_identity()
+
+    caller = svc.get_user(current_user_id)
+    if not caller:
+        return jsonify({'error': 'Caller not found'}), 403
+
+    role = (caller.get('role') or '').lower().strip()
+    role_aliases = {'admin': 'coordinator', 'employee': 'adviser'}
+    role = role_aliases.get(role, role)
+
+    allowed_roles = {'coordinator', 'chairman', 'adviser', 'supervisor'}
+    if role not in allowed_roles:
+        return jsonify({'error': 'Only coordinators, chairmen, advisers, or supervisors can delete attendance records'}), 403
+
+    record = svc.get_attendance_record(record_id)
+    if not record:
+        return jsonify({'error': 'Record not found'}), 404
+
+    # Supervisors can only delete records for students assigned to their company
+    if role == 'supervisor':
+        caller_company = (caller.get('company') or caller.get('companyName') or '').strip().lower()
+        if caller_company:
+            student = svc.get_user(record.get('userId', ''))
+            student_company = (student.get('company') or student.get('companyName') or '').strip().lower() if student else ''
+            if student_company and student_company != caller_company:
+                return jsonify({'error': 'You can only delete records for your own interns'}), 403
+
+    result = svc.delete_attendance_record(record_id)
+    if result.get('success'):
+        print(f"[delete-attendance] Record {record_id} deleted by {caller.get('name')} ({role})")
+        return jsonify({'success': True}), 200
+    return jsonify({'error': result.get('error', 'Delete failed')}), 400

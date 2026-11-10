@@ -20,7 +20,7 @@ attendance_bp = Blueprint('attendance', __name__)
 _firebase_service = None
 
 # Firebase Storage bucket name (projectId.appspot.com)
-STORAGE_BUCKET = os.environ.get('FIREBASE_STORAGE_BUCKET', 'login-system-292a0.appspot.com')
+STORAGE_BUCKET = os.environ.get('FIREBASE_STORAGE_BUCKET', 'trackit-system-3fcdd.firebasestorage.app')
 
 
 def _upload_to_firebase_storage(image_bytes: bytes, destination_path: str):

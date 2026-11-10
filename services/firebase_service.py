@@ -51,7 +51,7 @@ from firebase_admin.exceptions import FirebaseError
 
 # Default Storage bucket — override via FIREBASE_STORAGE_BUCKET env var
 _DEFAULT_STORAGE_BUCKET = os.environ.get(
-    'FIREBASE_STORAGE_BUCKET', 'trackit-system-3fcdd.appspot.com'
+    'FIREBASE_STORAGE_BUCKET', 'trackit-system-3fcdd.firebasestorage.app'
 )
 
 # Philippine Time is fixed at UTC+8 (the deployment does not observe DST).

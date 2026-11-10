@@ -122,6 +122,22 @@ def _read_upload_bytes(file_storage):
     return data or None
 
 
+def _compress_face_photo(image_bytes: bytes, max_dim: int = 800, quality: int = 70) -> bytes:
+    """Downscale/re-encode a JPEG so base64 fallback stays well under Firestore's 1 MiB doc limit."""
+    try:
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(image_bytes))
+        img = img.convert('RGB')
+        img.thumbnail((max_dim, max_dim))
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=quality, optimize=True)
+        return buf.getvalue()
+    except Exception as e:
+        print(f"[PHOTO] Compression failed, using original bytes: {e}")
+        return image_bytes
+
+
 def _save_face_photo_bytes(image_bytes: bytes, user_id: str, event: str, filename_hint: str = 'photo.jpg'):
     """
     Upload face photo to Firebase Storage; return the public download URL.
@@ -135,19 +151,20 @@ def _save_face_photo_bytes(image_bytes: bytes, user_id: str, event: str, filenam
         ext = '.jpg'
     filename = f"{event}_{user_id}_{uuid.uuid4().hex[:8]}{ext}"
 
-    url = _upload_to_firebase_storage(image_bytes, f'checkin_photos/{filename}')
+    # Compress first — smaller uploads and a much smaller base64 fallback.
+    compressed = _compress_face_photo(image_bytes)
+
+    url = _upload_to_firebase_storage(compressed, f'checkin_photos/{filename}')
     if url:
         print(f"[OK] Face photo uploaded to Firebase Storage: {url}")
         return url
 
-    # Firebase Storage upload failed (missing service account permissions or
-    # bucket not configured on this deployment). Fall back to a base64 data URL
-    # so the photo still shows in the web admin dashboard.
+    # Firebase Storage is unavailable on this project (no billing/bucket).
+    # Fall back to a compressed base64 data URL stored in Firestore.
     print(f"[WARN] Firebase Storage upload failed — using base64 data URL fallback")
     import base64 as _b64
-    mime = 'image/jpeg' if ext in ('.jpg', '.jpeg') else f'image/{ext.lstrip(".")}'
-    b64 = _b64.b64encode(image_bytes).decode('utf-8')
-    data_url = f"data:{mime};base64,{b64}"
+    b64 = _b64.b64encode(compressed).decode('utf-8')
+    data_url = f"data:image/jpeg;base64,{b64}"
     print(f"[OK] Face photo stored as base64 data URL ({len(data_url)} chars)")
     return data_url
 
@@ -167,18 +184,23 @@ def _resolve_face_photo_url(parsed, current_user_id: str, event: str):
     override = (parsed.get('facePhotoUrl') or '').strip() or None
     saved = None
 
-    print(f"[PHOTO RESOLVE] event={event} user={current_user_id} has_file={face_photo_file is not None} override_url={override}")
+    def _log_url(u):
+        if not u:
+            return None
+        return u if len(u) < 120 else f"{u[:80]}...<{len(u)} chars>"
+
+    print(f"[PHOTO RESOLVE] event={event} user={current_user_id} has_file={face_photo_file is not None} override_url={_log_url(override)}")
 
     if face_photo_file:
         saved = _save_face_photo(face_photo_file, current_user_id, event)
-        print(f"[PHOTO RESOLVE] saved local/storage URL: {saved}")
+        print(f"[PHOTO RESOLVE] saved local/storage URL: {_log_url(saved)}")
 
     if override and override.startswith(('http://', 'https://')):
         print(f"[PHOTO RESOLVE] using override Firebase URL: {override}")
         return override
 
     final_url = saved or override
-    print(f"[PHOTO RESOLVE] final URL returned: {final_url}")
+    print(f"[PHOTO RESOLVE] final URL returned: {_log_url(final_url)}")
     return final_url
 
 
@@ -548,7 +570,7 @@ def record_checkin():
         new_log_entry['supervisor_id'] = supervisor_id_val
     if face_photo_url:
         new_log_entry['checkInFacePhotoUrl'] = face_photo_url
-        print(f"[CHECK-IN] Added checkInFacePhotoUrl to log entry: {face_photo_url}")
+        print(f"[CHECK-IN] Added checkInFacePhotoUrl to log entry: {face_photo_url[:80]}..." if len(face_photo_url) > 120 else f"[CHECK-IN] Added checkInFacePhotoUrl to log entry: {face_photo_url}")
     else:
         print(f"[CHECK-IN] WARNING: No face_photo_url available to save")
 
@@ -803,7 +825,7 @@ def record_checkout():
         }
         if face_photo_url:
             entry['checkOutFacePhotoUrl'] = face_photo_url
-            print(f"[CHECK-OUT] Added checkOutFacePhotoUrl to log entry: {face_photo_url}")
+            print(f"[CHECK-OUT] Added checkOutFacePhotoUrl to log entry: {face_photo_url[:80]}..." if len(face_photo_url) > 120 else f"[CHECK-OUT] Added checkOutFacePhotoUrl to log entry: {face_photo_url}")
         else:
             print(f"[CHECK-OUT] WARNING: No face_photo_url available to save")
         entry['checkOutFaceVerified'] = face_verified

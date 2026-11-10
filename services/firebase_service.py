@@ -1261,6 +1261,11 @@ class FirebaseService:
                     return v.strip()
             return None
 
+        def _log_safe(url):
+            if not url:
+                return None
+            return url if len(url) < 120 else f"{url[:80]}...<{len(url)} chars>"
+
         logs = record.get('timeLogs') if isinstance(record.get('timeLogs'), list) else []
         check_in = _first(
             record.get('checkInFacePhotoUrl'),
@@ -1271,7 +1276,7 @@ class FirebaseService:
             record.get('checkOutFacePhotoUrl'),
             record.get('checkOutPhotoUrl'),
         )
-        print(f"[PHOTO NORMALIZE] record_id={record.get('id')} initial check_in={check_in} check_out={check_out}")
+        print(f"[PHOTO NORMALIZE] record_id={record.get('id')} initial check_in={_log_safe(check_in)} check_out={_log_safe(check_out)}")
         for log in logs:
             if not isinstance(log, dict):
                 continue
@@ -1282,10 +1287,10 @@ class FirebaseService:
                 check_out = candidate_out
         if check_in:
             record['checkInFacePhotoUrl'] = check_in
-            print(f"[PHOTO NORMALIZE] set checkInFacePhotoUrl={check_in}")
+            print(f"[PHOTO NORMALIZE] set checkInFacePhotoUrl={_log_safe(check_in)}")
         if check_out:
             record['checkOutFacePhotoUrl'] = check_out
-            print(f"[PHOTO NORMALIZE] set checkOutFacePhotoUrl={check_out}")
+            print(f"[PHOTO NORMALIZE] set checkOutFacePhotoUrl={_log_safe(check_out)}")
         return record
 
     # ── Attendance session helpers ────────────────────────────────────────────
@@ -1361,6 +1366,13 @@ class FirebaseService:
         if seconds < 0:
             return None
         return round(seconds / 3600, 2)
+
+    @staticmethod
+    def _first_present(*values):
+        for value in values:
+            if value is not None and str(value).strip() != '':
+                return value
+        return None
 
     def normalize_attendance_record(
         self,
@@ -1441,6 +1453,39 @@ class FirebaseService:
                 ):
                     if logs[0].get(key) is None and normalized.get(key) is not None:
                         logs[0][key] = normalized.get(key)
+
+            # Backfill per-session photos from the top-level compat fields so
+            # the admin dashboard can show check-in/check-out photos for each
+            # session even on records written before per-log photo fields
+            # existed. Top-level check-in photo belongs to the earliest
+            # check-in; top-level check-out photo to the latest check-out.
+            top_check_in_photo = self._first_present(
+                normalized.get('checkInFacePhotoUrl'),
+                normalized.get('checkInPhotoUrl'),
+                normalized.get('facePhotoUrl'),
+            )
+            if top_check_in_photo:
+                for entry in logs:
+                    if entry.get('checkIn') and not self._first_present(
+                        entry.get('checkInFacePhotoUrl'),
+                        entry.get('checkInPhotoUrl'),
+                        entry.get('facePhotoUrl'),
+                    ):
+                        entry['checkInFacePhotoUrl'] = top_check_in_photo
+                        break
+
+            top_check_out_photo = self._first_present(
+                normalized.get('checkOutFacePhotoUrl'),
+                normalized.get('checkOutPhotoUrl'),
+            )
+            if top_check_out_photo:
+                for entry in reversed(logs):
+                    if entry.get('checkOut') and not self._first_present(
+                        entry.get('checkOutFacePhotoUrl'),
+                        entry.get('checkOutPhotoUrl'),
+                    ):
+                        entry['checkOutFacePhotoUrl'] = top_check_out_photo
+                        break
 
             normalized['timeLogs'] = logs
 

@@ -24,25 +24,9 @@ STORAGE_BUCKET = os.environ.get('FIREBASE_STORAGE_BUCKET', 'trackit-system-3fcdd
 
 
 def _upload_to_firebase_storage(image_bytes: bytes, destination_path: str):
-    """Upload bytes to Firebase Storage and return the public download URL."""
-    try:
-        from firebase_admin import storage
-        bucket = storage.bucket()
-        blob = bucket.blob(destination_path)
-        blob.upload_from_string(image_bytes, content_type='image/jpeg')
-        token = str(_uuid.uuid4())
-        blob.metadata = {'firebaseStorageDownloadTokens': token}
-        blob.patch()
-        download_url = (
-            f"https://firebasestorage.googleapis.com/v0/b/{bucket.name}"
-            f"/o/{_urllib_parse.quote(destination_path, safe='')}"
-            f"?alt=media&token={token}"
-        )
-        print(f"[Storage] Uploaded {destination_path} → {download_url}")
-        return download_url
-    except Exception as e:
-        print(f"[ERROR] Firebase Storage upload failed for {destination_path}: {e}")
-        return None
+    """Firebase Storage requires Blaze plan — skip and return None to use base64 fallback."""
+    print(f"[Storage] Skipping Firebase Storage (Spark plan) — using base64 fallback for {destination_path}")
+    return None
 
 
 def set_firebase_service(service):

@@ -57,6 +57,55 @@ def _get_service() -> FirebaseService:
     return _firebase_service
 
 
+def _hhmm(value, default_minutes: int) -> int:
+    try:
+        hour_text, minute_text = str(value).strip().split(':')[:2]
+        return int(hour_text) * 60 + int(minute_text)
+    except Exception:
+        return default_minutes
+
+
+def _log_session(entry: dict) -> str:
+    session = str((entry or {}).get('session') or '').strip().lower()
+    if session in ('morning', 'am'):
+        return 'morning'
+    if session in ('afternoon', 'pm'):
+        return 'afternoon'
+    return ''
+
+
+def _is_open_log(entry: dict) -> bool:
+    return bool(entry.get('checkIn')) and not entry.get('checkOut')
+
+
+def _latest_open_log_index(logs: list):
+    for index in range(len(logs) - 1, -1, -1):
+        if _is_open_log(logs[index]):
+            return index
+    return None
+
+
+def _entry_hours(entry: dict):
+    hours = entry.get('workHours', entry.get('hours'))
+    if hours is None:
+        hours = FirebaseService._hours_between(entry.get('checkIn'), entry.get('checkOut'))
+    try:
+        return float(hours) if hours is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _completed_hours(logs: list) -> float:
+    return round(sum(_entry_hours(e) for e in logs if e.get('checkOut')), 2)
+
+
+def _first_checkin_time(record: dict, logs: list):
+    times = [e.get('checkIn') for e in logs if e.get('checkIn')]
+    if record.get('checkIn'):
+        times.append(record.get('checkIn'))
+    return min((t for t in times if t), key=lambda t: str(t), default=None)
+
+
 def _read_upload_bytes(file_storage):
     """Read a Werkzeug FileStorage fully into memory so the stream can be reused."""
     if not file_storage:
@@ -470,16 +519,12 @@ def record_checkin():
         print(f"[ERROR] get_today_attendance failed: {e}")
         return jsonify({'error': f'Database error: {str(e)}'}), 500
 
-    # ── Duplicate check for this session ─────────────────────────────────────
-    if existing and session in ('morning', 'afternoon'):
-        time_logs_existing = existing.get('timeLogs') or []
-        already_checked_in = any(
-            e.get('session') == session and e.get('checkIn')
-            for e in time_logs_existing
-        )
-        if already_checked_in:
-            return jsonify({'error': f'Already checked in for the {session} session.'}), 400
-    # ─────────────────────────────────────────────────────────────────────────
+    try:
+        settings = svc.get_settings()
+        student = svc.get_user(current_user_id)
+    except Exception:
+        settings = {}
+        student = None
 
     supervisor_id_val = (student.get('supervisorId') if student else None) or ''
 
@@ -507,18 +552,37 @@ def record_checkin():
     else:
         print(f"[CHECK-IN] WARNING: No face_photo_url available to save")
 
-    if existing:
-        # Check if there is already an open (not yet checked-out) log entry
-        time_logs = existing.get('timeLogs') or []
-        open_entry = next((e for e in time_logs if e.get('checkIn') and not e.get('checkOut')), None)
-        if open_entry:
-            return jsonify({'error': 'Already checked in. Please check out first.'}), 400
+    def _checkin_mutation(current_record: dict):
+        normalized = svc.normalize_attendance_record(
+            current_record, student=student, settings=settings
+        )
+        time_logs = normalized.get('timeLogs') or []
 
-        # Append a new log entry to existing record
-        time_logs.append(new_log_entry)
+        same_session_logs = [
+            entry for entry in time_logs
+            if _log_session(entry) == session and entry.get('checkIn')
+        ]
+        if same_session_logs:
+            if any(entry.get('checkOut') for entry in same_session_logs):
+                return {'_error': 'You have already completed this session.'}
+            return {
+                '_error': 'Please check out first. You already have an active attendance session.'
+            }
+
+        open_index = _latest_open_log_index(time_logs)
+        if open_index is not None:
+            open_session = _log_session(time_logs[open_index]) or 'another'
+            return {
+                '_error': (
+                    'Please check out first. You already have an active '
+                    f'{open_session} attendance session.'
+                )
+            }
+
+        time_logs.append(dict(new_log_entry))
         update_data = {
             'timeLogs':  time_logs,
-            'checkIn':   existing.get('checkIn') or now_iso,  # keep first check-in time
+            'checkIn':   _first_checkin_time(normalized, time_logs) or now_iso,
             'updatedAt': now_iso,
             'status':    attendance_status,
         }
@@ -526,65 +590,89 @@ def record_checkin():
             update_data['morningSession'] = 'checked_in'
         elif session == 'afternoon':
             update_data['afternoonSession'] = 'checked_in'
-        if face_photo_url:
+
+        has_checkin_photo = bool(current_record.get('checkInFacePhotoUrl')) or any(
+            entry.get('checkInFacePhotoUrl') or entry.get('checkInPhotoUrl')
+            for entry in time_logs[:-1]
+        )
+        if face_photo_url and not has_checkin_photo:
             update_data['checkInFacePhotoUrl'] = face_photo_url
-        if getattr(svc, 'db', None):
+
+        return update_data
+
+    record_to_update = existing
+    while True:
+        if record_to_update:
             try:
-                from google.cloud.firestore import DELETE_FIELD
-                update_data['checkOut'] = DELETE_FIELD
-            except Exception:
-                pass
+                result = svc.mutate_attendance_record(
+                    record_to_update['id'], _checkin_mutation
+                )
+            except Exception as e:
+                print(f"[ERROR] mutate_attendance_record failed: {e}")
+                return jsonify({'error': f'Failed to update record: {str(e)}'}), 500
+
+            if result.get('success'):
+                log_count = len((result.get('record') or {}).get('timeLogs') or [])
+                print(
+                    f"[CHECK-IN] Re-check-in success for user={current_user_id} "
+                    f"session={session} (log #{log_count})"
+                )
+                return jsonify({
+                    'success': True,
+                    'record': result['record'],
+                    'session': session,
+                    'status': attendance_status,
+                }), 201
+            return jsonify({'error': result.get('error', 'Check-in failed')}), 400
+
+        record = {
+            'userId':    current_user_id,
+            'date':      today,
+            # Top-level fields kept for backward-compat
+            'checkIn':   now_iso,
+            'checkInLocation': {
+                'latitude':  latitude,
+                'longitude': longitude,
+                'address':   address,
+                'accuracy':  accuracy,
+            },
+            'faceVerified':        face_verified,
+            'livenessVerified':    liveness_verified,
+            'locationDisabled':    location_disabled,
+            'status':    attendance_status,
+            'session':   session,
+            'createdAt': now_iso,
+            # New: array of individual time-log pairs
+            'timeLogs': [new_log_entry],
+        }
+        if session == 'morning':
+            record['morningSession'] = 'checked_in'
+        elif session == 'afternoon':
+            record['afternoonSession'] = 'checked_in'
+        if face_photo_url:
+            record['checkInFacePhotoUrl'] = face_photo_url
+
         try:
-            result = svc.update_attendance_record(existing['id'], update_data)
+            result = svc.create_attendance_record_once(record)
         except Exception as e:
-            print(f"[ERROR] update_attendance_record failed: {e}")
-            return jsonify({'error': f'Failed to update record: {str(e)}'}), 500
+            print(f"[ERROR] create_attendance_record_once failed: {e}")
+            return jsonify({'error': f'Failed to save record: {str(e)}'}), 500
 
         if result.get('success'):
-            print(f"[CHECK-IN] Re-check-in success for user={current_user_id} session={session} (log #{len(time_logs)})")
-            return jsonify({'success': True, 'record': result['record'], 'session': session, 'status': attendance_status}), 201
+            print(f"[CHECK-IN] Success for user={current_user_id} session={session}")
+            return jsonify({
+                'success': True,
+                'record': result['record'],
+                'session': session,
+                'status': attendance_status,
+            }), 201
+
+        if result.get('conflict') and result.get('record'):
+            record_to_update = result['record']
+            continue
+
+        print(f"[ERROR] Check-in failed: {result.get('error')}")
         return jsonify({'error': result.get('error', 'Check-in failed')}), 400
-
-    # No record yet — create fresh
-    record = {
-        'userId':    current_user_id,
-        'date':      today,
-        # Top-level fields kept for backward-compat
-        'checkIn':   now_iso,
-        'checkInLocation': {
-            'latitude':  latitude,
-            'longitude': longitude,
-            'address':   address,
-            'accuracy':  accuracy,
-        },
-        'faceVerified':        face_verified,
-        'livenessVerified':    liveness_verified,
-        'locationDisabled':    location_disabled,
-        'status':    attendance_status,
-        'session':   session,
-        'createdAt': now_iso,
-        # New: array of individual time-log pairs
-        'timeLogs': [new_log_entry],
-    }
-    if session == 'morning':
-        record['morningSession'] = 'checked_in'
-    elif session == 'afternoon':
-        record['afternoonSession'] = 'checked_in'
-    if face_photo_url:
-        record['checkInFacePhotoUrl'] = face_photo_url
-
-    try:
-        result = svc.create_attendance_record(record)
-    except Exception as e:
-        print(f"[ERROR] create_attendance_record failed: {e}")
-        return jsonify({'error': f'Failed to save record: {str(e)}'}), 500
-
-    if result.get('success'):
-        print(f"[CHECK-IN] Success for user={current_user_id} session={session}")
-        return jsonify({'success': True, 'record': result['record'], 'session': session, 'status': attendance_status}), 201
-
-    print(f"[ERROR] Check-in failed: {result.get('error')}")
-    return jsonify({'error': result.get('error', 'Check-in failed')}), 400
 
 
 @attendance_bp.route('/checkout', methods=['POST'])
@@ -671,93 +759,109 @@ def record_checkout():
     except Exception as e:
         return jsonify({'error': f'Database error: {str(e)}'}), 500
 
-    if not existing or not existing.get('checkIn'):
-        return jsonify({'error': 'No check-in record found for today'}), 400
+    if not existing:
+        return jsonify({'error': 'You must check in before checking out.'}), 400
+
+    try:
+        settings = svc.get_settings()
+        student = svc.get_user(current_user_id)
+    except Exception:
+        settings = {}
+        student = None
 
     check_out_time = datetime.now(timezone.utc)
     check_out_iso  = check_out_time.isoformat()
-
-    # Find the latest open log entry and close it
-    time_logs = existing.get('timeLogs') or []
-    open_idx = next(
-        (i for i, e in reversed(list(enumerate(time_logs)))
-         if e.get('checkIn') and not e.get('checkOut')),
-        None
-    )
-
-    if open_idx is None:
-        return jsonify({'error': 'No active check-in found. Please check in first.'}), 400
-
-    # Close the open entry
-    entry = time_logs[open_idx]
-    session = entry.get('session', 'morning')
-    entry['checkOut'] = check_out_iso
-    entry['checkOutLocation'] = {
-        'latitude':  latitude,
-        'longitude': longitude,
-        'address':   address,
-        'accuracy':  accuracy,
-    }
-    if face_photo_url:
-        entry['checkOutFacePhotoUrl'] = face_photo_url
-        print(f"[CHECK-OUT] Added checkOutFacePhotoUrl to log entry: {face_photo_url}")
-    else:
-        print(f"[CHECK-OUT] WARNING: No face_photo_url available to save")
-    entry['checkOutFaceVerified'] = face_verified
-    entry['locationDisabled']     = location_disabled
+    checkout_session = None
     session_hours = 0.0
-    try:
-        ci_dt = datetime.fromisoformat(entry['checkIn'])
-        session_hours = round((check_out_time - ci_dt).total_seconds() / 3600, 2)
-        entry['workHours'] = session_hours
-        entry['hours'] = session_hours  # alias per spec
-    except Exception:
-        pass
-    time_logs[open_idx] = entry
+    total_hours = 0.0
 
-    # Recalculate total work hours across all completed log entries
-    total_hours = sum(
-        float(e.get('workHours') or 0) for e in time_logs if e.get('checkOut')
-    )
+    def _checkout_mutation(current_record: dict):
+        nonlocal checkout_session, session_hours, total_hours
 
-    # Compute overall record status
-    has_open = any(e.get('checkIn') and not e.get('checkOut') for e in time_logs)
-    if has_open:
-        overall_status = 'incomplete'
-    else:
-        # Use the status of the last completed timeLogs entry
-        completed = [e for e in time_logs if e.get('checkOut')]
-        if completed:
-            last_status = completed[-1].get('status', existing.get('status', 'present'))
-            overall_status = last_status if last_status in ('present', 'late', 'absent') else existing.get('status', 'present')
-        else:
-            overall_status = existing.get('status', 'present')
+        normalized = svc.normalize_attendance_record(
+            current_record, student=student, settings=settings
+        )
+        time_logs = normalized.get('timeLogs') or []
+        has_any_checkin = bool(normalized.get('checkIn')) or any(
+            entry.get('checkIn') for entry in time_logs
+        )
+        if not has_any_checkin:
+            return {'_error': 'You must check in before checking out.'}
 
-    update_data = {
-        'timeLogs':             time_logs,
-        # Top-level checkOut = time of the most recent checkout (for backward compat)
-        'checkOut':             check_out_iso,
-        'checkOutLocation': {
+        open_idx = _latest_open_log_index(time_logs)
+        if open_idx is None:
+            return {'_error': 'You have already completed this session.'}
+
+        entry = time_logs[open_idx]
+        checkout_session = _log_session(entry) or 'morning'
+        entry['checkOut'] = check_out_iso
+        entry['checkOutLocation'] = {
             'latitude':  latitude,
             'longitude': longitude,
             'address':   address,
             'accuracy':  accuracy,
-        },
-        'checkOutFaceVerified': face_verified,
-        'locationDisabled':     location_disabled,
-        'workHours':            round(total_hours, 2),
-        'status':               overall_status,
-        'updatedAt':            check_out_iso,
-    }
-    if session == 'morning':
-        update_data['morningSession'] = 'completed'
-    elif session == 'afternoon':
-        update_data['afternoonSession'] = 'completed'
-    if face_photo_url:
-        update_data['checkOutFacePhotoUrl'] = face_photo_url
+        }
+        if face_photo_url:
+            entry['checkOutFacePhotoUrl'] = face_photo_url
+            print(f"[CHECK-OUT] Added checkOutFacePhotoUrl to log entry: {face_photo_url}")
+        else:
+            print(f"[CHECK-OUT] WARNING: No face_photo_url available to save")
+        entry['checkOutFaceVerified'] = face_verified
+        entry['locationDisabled']     = location_disabled
+
+        session_hours = FirebaseService._hours_between(
+            entry.get('checkIn'), check_out_iso
+        ) or 0.0
+        entry['workHours'] = session_hours
+        entry['hours'] = session_hours  # alias per spec
+        time_logs[open_idx] = entry
+
+        # Total hours come only from completed sessions; an open check-in is
+        # intentionally excluded until it has a check-out timestamp.
+        total_hours = _completed_hours(time_logs)
+
+        has_open = any(_is_open_log(e) for e in time_logs)
+        if has_open:
+            overall_status = 'incomplete'
+        else:
+            completed = [e for e in time_logs if e.get('checkOut')]
+            if completed:
+                last_status = completed[-1].get(
+                    'status', normalized.get('status', 'present')
+                )
+                overall_status = last_status if last_status in (
+                    'present', 'late', 'absent'
+                ) else normalized.get('status', 'present')
+            else:
+                overall_status = normalized.get('status', 'present')
+
+        update_data = {
+            'timeLogs':             time_logs,
+            # Top-level checkOut = time of the most recent checkout (for backward compat)
+            'checkOut':             check_out_iso,
+            'checkOutLocation': {
+                'latitude':  latitude,
+                'longitude': longitude,
+                'address':   address,
+                'accuracy':  accuracy,
+            },
+            'checkOutFaceVerified': face_verified,
+            'locationDisabled':     location_disabled,
+            'workHours':            total_hours,
+            'status':               overall_status,
+            'updatedAt':            check_out_iso,
+        }
+        if checkout_session == 'morning':
+            update_data['morningSession'] = 'completed'
+        elif checkout_session == 'afternoon':
+            update_data['afternoonSession'] = 'completed'
+        if face_photo_url:
+            update_data['checkOutFacePhotoUrl'] = face_photo_url
+
+        return update_data
 
     try:
-        result = svc.update_attendance_record(existing['id'], update_data)
+        result = svc.mutate_attendance_record(existing['id'], _checkout_mutation)
     except Exception as e:
         return jsonify({'error': f'Failed to update record: {str(e)}'}), 500
 
@@ -765,9 +869,9 @@ def record_checkout():
         return jsonify({
             'success': True,
             'record': result['record'],
-            'session': session,
+            'session': checkout_session,
             'sessionHours': session_hours,
-            'totalHours': round(total_hours, 2),
+            'totalHours': total_hours,
         }), 200
 
     return jsonify({'error': result.get('error', 'Check-out failed')}), 400
@@ -781,65 +885,88 @@ def auto_checkout():
     """
     svc = _get_service()
     current_user_id = get_jwt_identity()
-    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    today = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%Y-%m-%d')
 
     try:
         existing = svc.get_today_attendance(current_user_id, today)
     except Exception as e:
         return jsonify({'error': f'Database error: {str(e)}'}), 500
 
-    if not existing or not existing.get('checkIn'):
+    if not existing:
         return jsonify({'success': True, 'message': 'No active session'}), 200
 
-    # Find open log entry
-    time_logs = existing.get('timeLogs') or []
-    open_idx = next(
-        (i for i, e in reversed(list(enumerate(time_logs)))
-         if e.get('checkIn') and not e.get('checkOut')),
-        None
-    )
-    if open_idx is None:
-        return jsonify({'success': True, 'message': 'No active session'}), 200
+    try:
+        settings = svc.get_settings()
+        student = svc.get_user(current_user_id)
+    except Exception:
+        settings = {}
+        student = None
 
     check_out_time = datetime.now(timezone.utc)
     check_out_iso = check_out_time.isoformat()
 
-    entry = time_logs[open_idx]
-    entry['checkOut'] = check_out_iso
-    entry['autoCheckout'] = True
-    try:
-        ci_dt = datetime.fromisoformat(entry['checkIn'])
-        entry['workHours'] = round((check_out_time - ci_dt).total_seconds() / 3600, 2)
-    except Exception:
-        pass
-    time_logs[open_idx] = entry
+    def _auto_checkout_mutation(current_record: dict):
+        normalized = svc.normalize_attendance_record(
+            current_record, student=student, settings=settings
+        )
+        time_logs = normalized.get('timeLogs') or []
+        open_idx = _latest_open_log_index(time_logs)
+        if open_idx is None:
+            return {'_error': 'No active session'}
 
-    total_hours = sum(float(e.get('workHours') or 0) for e in time_logs if e.get('checkOut'))
+        entry = time_logs[open_idx]
+        session = _log_session(entry) or 'morning'
+        entry['checkOut'] = check_out_iso
+        entry['autoCheckout'] = True
+        entry['workHours'] = FirebaseService._hours_between(
+            entry.get('checkIn'), check_out_iso
+        ) or 0.0
+        entry['hours'] = entry['workHours']
+        time_logs[open_idx] = entry
 
-    update_data = {
-        'timeLogs':   time_logs,
-        'checkOut':   check_out_iso,
-        'workHours':  round(total_hours, 2),
-        'autoCheckout': True,
-        'updatedAt':  check_out_iso,
-    }
+        total_hours = _completed_hours(time_logs)
+        has_open = any(_is_open_log(e) for e in time_logs)
+        if has_open:
+            overall_status = 'incomplete'
+        else:
+            completed = [e for e in time_logs if e.get('checkOut')]
+            last_status = completed[-1].get('status', normalized.get('status', 'present')) if completed else normalized.get('status', 'present')
+            overall_status = last_status if last_status in ('present', 'late', 'absent') else normalized.get('status', 'present')
+
+        update_data = {
+            'timeLogs':   time_logs,
+            'checkOut':   check_out_iso,
+            'workHours':  total_hours,
+            'status':     overall_status,
+            'autoCheckout': True,
+            'updatedAt':  check_out_iso,
+        }
+        if session == 'morning':
+            update_data['morningSession'] = 'completed'
+        elif session == 'afternoon':
+            update_data['afternoonSession'] = 'completed'
+        return update_data
+
     try:
-        result = svc.update_attendance_record(existing['id'], update_data)
+        result = svc.mutate_attendance_record(existing['id'], _auto_checkout_mutation)
     except Exception as e:
         return jsonify({'error': f'Failed to update record: {str(e)}'}), 500
 
     if result.get('success'):
         return jsonify({'success': True, 'record': result['record']}), 200
+    if result.get('error') == 'No active session':
+        return jsonify({'success': True, 'message': 'No active session'}), 200
     return jsonify({'error': result.get('error', 'Auto-checkout failed')}), 400
 
 
 
+@attendance_bp.route('/reset-today', methods=['POST'])
 @jwt_required()
 def reset_today_attendance():
     """Clear today's attendance so the student can check in again (e.g. mistaken early checkout)."""
     svc = _get_service()
     current_user_id = get_jwt_identity()
-    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    today = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%Y-%m-%d')
 
     try:
         existing = svc.get_today_attendance(current_user_id, today)

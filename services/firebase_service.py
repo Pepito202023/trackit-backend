@@ -9,6 +9,7 @@ import secrets
 import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any
+import copy
 
 try:
     from werkzeug.security import generate_password_hash, check_password_hash
@@ -50,8 +51,12 @@ from firebase_admin.exceptions import FirebaseError
 
 # Default Storage bucket — override via FIREBASE_STORAGE_BUCKET env var
 _DEFAULT_STORAGE_BUCKET = os.environ.get(
-    'FIREBASE_STORAGE_BUCKET', 'login-system-292a0.appspot.com'
+    'FIREBASE_STORAGE_BUCKET', 'trackit-system-3fcdd.appspot.com'
 )
+
+# Philippine Time is fixed at UTC+8 (the deployment does not observe DST).
+PH_TZ = timezone(timedelta(hours=8))
+
 
 class FirebaseService:
     """Firebase service for database operations using Firestore"""
@@ -106,6 +111,7 @@ class FirebaseService:
     def _find_service_account_key(self) -> Optional[str]:
         """Find Firebase service account key file"""
         possible_paths = [
+            os.path.join(os.path.dirname(__file__), 'trackit-system-3fcdd-firebase-adminsdk-fbsvc-067346649f.json'),
             os.path.join(os.path.dirname(__file__), 'login-system-292a0-firebase-adminsdk-fbsvc-e84bb03b25.json'),
             os.path.join(os.path.dirname(__file__), '..', 'serviceAccountKey.json'),
             os.path.join(os.path.dirname(__file__), 'serviceAccountKey.json'),
@@ -138,6 +144,8 @@ class FirebaseService:
             'requireGpsVerification': True
         }
         self.companies_db = {}
+        # Supervisor-specific OJT schedules (local-mode fallback store), keyed by supervisorId
+        self.supervisor_schedules_db = {}
         # Load persisted users from file
         self.users_db = self._load_users_from_file()
         if not self.users_db:
@@ -447,7 +455,24 @@ class FirebaseService:
                     }
                 return {'success': True, 'user': candidates[0]}
         except Exception as e:
+            err_str = str(e)
             print(f"Error verifying user: {e}")
+            # Firestore quota exceeded (429) — retry once with a direct email query
+            if '429' in err_str or 'Quota' in err_str or 'quota' in err_str:
+                import time as _time
+                _time.sleep(2)
+                try:
+                    if self.db:
+                        for user_doc in self.db.collection('users').where('email', '==', email).stream():
+                            user_data = user_doc.to_dict()
+                            user_data['id'] = user_doc.id
+                            user_data = self._normalize_user_role(user_data, user_doc.reference)
+                            if self._password_matches(user_data, password):
+                                return {'success': True, 'user': user_data}
+                        return {'success': False, 'error': 'Invalid email or password'}
+                except Exception as e2:
+                    print(f"Retry also failed: {e2}")
+                    return {'success': False, 'error': 'Service temporarily busy. Please try again in a moment.'}
             return {'success': False, 'error': 'Authentication error'}
     
     def verify_user_by_id(self, id_number: str, password: str, role: str = None) -> Dict:
@@ -739,6 +764,26 @@ class FirebaseService:
         except Exception as e:
             print(f"Error updating user: {e}")
             return {'success': False, 'error': str(e)}
+
+    def set_user_password(self, user_id: str, plaintext_password: str) -> bool:
+        """Hash and store a new password for the user. Returns True on success."""
+        try:
+            hashed = _hash_password(plaintext_password)
+            if self.db:
+                self.db.collection('users').document(user_id).update({
+                    'password': hashed,
+                    'mustChangePassword': True,
+                    'updatedAt': datetime.now().isoformat(),
+                })
+            else:
+                if user_id in self.users_db:
+                    self.users_db[user_id]['password'] = hashed
+                    self.users_db[user_id]['mustChangePassword'] = True
+                    self._save_users_to_file()
+            return True
+        except Exception as e:
+            print(f"[set_user_password] Failed for {user_id}: {e}")
+            return False
 
     def delete_user(self, user_id: str) -> Dict:
         """Delete a user by ID"""
@@ -1167,6 +1212,44 @@ class FirebaseService:
         return value
 
     @staticmethod
+    def _strip_base64_blobs(data: dict) -> dict:
+        """
+        Remove any base64-encoded image data from an attendance record dict before
+        writing to Firestore — base64 blobs can push documents past Firestore's 1 MB
+        limit and cause update failures.  URLs (http/https or Firebase Storage gs://)
+        are kept; only raw data: URIs and bare base64 strings are stripped.
+        """
+        BASE64_FIELDS = {
+            'faceData', 'checkInBase64', 'checkOutBase64',
+            'facePhotoBase64', 'imageBase64', 'photoBase64',
+        }
+        def _is_base64_blob(v):
+            if not isinstance(v, str):
+                return False
+            s = v.strip()
+            # data: URI (e.g. data:image/jpeg;base64,...)
+            if s.startswith('data:'):
+                return True
+            # Known base64-blob field name handled below
+            return False
+
+        def _clean(obj):
+            if isinstance(obj, dict):
+                result = {}
+                for k, v in obj.items():
+                    if k in BASE64_FIELDS:
+                        continue  # drop the whole field
+                    if _is_base64_blob(v):
+                        continue  # drop inline blob
+                    result[k] = _clean(v)
+                return result
+            if isinstance(obj, list):
+                return [_clean(item) for item in obj]
+            return obj
+
+        return _clean(data)
+
+    @staticmethod
     def hydrate_attendance_photos(record: Optional[Dict]) -> Optional[Dict]:
         """Copy face photos from timeLogs / aliases onto top-level fields for the dashboards."""
         if not isinstance(record, dict):
@@ -1205,6 +1288,164 @@ class FirebaseService:
             print(f"[PHOTO NORMALIZE] set checkOutFacePhotoUrl={check_out}")
         return record
 
+    # ── Attendance session helpers ────────────────────────────────────────────
+    @staticmethod
+    def _attendance_datetime(value) -> Optional[datetime]:
+        """Parse an attendance timestamp and return it in Philippine Time."""
+        if isinstance(value, datetime):
+            dt = value
+        elif isinstance(value, str) and value.strip():
+            text = value.strip()
+            try:
+                dt = datetime.fromisoformat(text.replace('Z', '+00:00'))
+            except ValueError:
+                try:
+                    dt = datetime.strptime(text[:19], '%Y-%m-%dT%H:%M:%S')
+                except ValueError:
+                    return None
+        else:
+            return None
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(PH_TZ)
+
+    @staticmethod
+    def _attendance_session_name(value) -> Optional[str]:
+        session = str(value or '').strip().lower()
+        if session in ('morning', 'am'):
+            return 'morning'
+        if session in ('afternoon', 'pm'):
+            return 'afternoon'
+        return None
+
+    @staticmethod
+    def _minutes_from_hhmm(value, default: int = 13 * 60) -> int:
+        try:
+            hour_text, minute_text = str(value).strip().split(':')[:2]
+            return int(hour_text) * 60 + int(minute_text)
+        except Exception:
+            return default
+
+    def _afternoon_checkin_minutes(self, student: Optional[Dict], settings: Optional[Dict]) -> int:
+        student = student or {}
+        settings = settings or {}
+        value = (
+            student.get('ojtAfternoonCheckinTime')
+            or settings.get('ojtAfternoonCheckinTime')
+            or settings.get('ojtStartTime')
+            or '13:00'
+        )
+        return self._minutes_from_hhmm(value, 13 * 60)
+
+    def _session_for_checkin(self, check_in, afternoon_checkin_minutes: int) -> str:
+        dt = self._attendance_datetime(check_in)
+        if dt is not None:
+            minutes = dt.hour * 60 + dt.minute
+        else:
+            # Fallback for legacy "HH:MM" strings.
+            try:
+                parts = str(check_in).strip().split(':')
+                minutes = int(parts[0]) * 60 + int(parts[1])
+            except Exception:
+                minutes = afternoon_checkin_minutes
+        return 'morning' if minutes < afternoon_checkin_minutes else 'afternoon'
+
+    @staticmethod
+    def _hours_between(check_in, check_out) -> Optional[float]:
+        start = FirebaseService._attendance_datetime(check_in)
+        end = FirebaseService._attendance_datetime(check_out)
+        if start is None or end is None:
+            return None
+        seconds = (end - start).total_seconds()
+        if seconds < 0:
+            return None
+        return round(seconds / 3600, 2)
+
+    def normalize_attendance_record(
+        self,
+        record: Optional[Dict],
+        student: Optional[Dict] = None,
+        settings: Optional[Dict] = None,
+    ) -> Optional[Dict]:
+        """Return an attendance record with a normalized ``timeLogs`` array.
+
+        Older records only stored ``checkIn``/``checkOut`` at the document root,
+        and offline-created entries may not have a ``session``.  Normalizing on
+        read lets every client and the admin dashboard use the same session
+        state without rewriting historical documents.
+        """
+        if not isinstance(record, dict):
+            return record
+
+        normalized = copy.deepcopy(record)
+        raw_logs = normalized.get('timeLogs')
+        logs = [copy.deepcopy(e) for e in raw_logs if isinstance(e, dict)] \
+            if isinstance(raw_logs, list) else []
+
+        if not logs and normalized.get('checkIn'):
+            session = self._attendance_session_name(normalized.get('session'))
+            if settings is None:
+                settings = self.get_settings()
+            if student is None and normalized.get('userId'):
+                student = self.get_user(normalized.get('userId'))
+            afternoon_minutes = self._afternoon_checkin_minutes(student, settings)
+            if session is None:
+                session = self._session_for_checkin(
+                    normalized.get('checkIn'), afternoon_minutes
+                )
+            legacy_entry = {'checkIn': normalized.get('checkIn'), 'session': session}
+            for key in (
+                'checkOut', 'workHours', 'hours', 'status', 'date',
+                'checkInLocation', 'checkOutLocation', 'checkInFacePhotoUrl',
+                'checkOutFacePhotoUrl', 'checkInPhotoUrl', 'checkOutPhotoUrl',
+                'facePhotoUrl', 'faceVerified', 'livenessVerified',
+                'checkInFaceVerified', 'checkOutFaceVerified', 'locationDisabled',
+            ):
+                if normalized.get(key) is not None:
+                    legacy_entry[key] = normalized.get(key)
+            logs = [legacy_entry]
+
+        if logs:
+            if settings is None:
+                settings = self.get_settings()
+            if student is None and normalized.get('userId'):
+                student = self.get_user(normalized.get('userId'))
+            afternoon_minutes = self._afternoon_checkin_minutes(student, settings)
+
+            for entry in logs:
+                session = self._attendance_session_name(entry.get('session'))
+                if session is None:
+                    session = self._session_for_checkin(
+                        entry.get('checkIn'), afternoon_minutes
+                    )
+                entry['session'] = session
+
+                # Fill a missing duration for closed legacy entries.
+                if entry.get('checkIn') and entry.get('checkOut') \
+                        and entry.get('workHours') is None \
+                        and entry.get('hours') is None:
+                    hours = self._hours_between(entry.get('checkIn'), entry.get('checkOut'))
+                    if hours is not None:
+                        entry['workHours'] = hours
+                        entry['hours'] = hours
+
+            # Some records have one root-level check-out but a timeLogs entry
+            # that was created before checkout details were copied into it.
+            if len(logs) == 1 and normalized.get('checkOut') \
+                    and not logs[0].get('checkOut'):
+                for key in (
+                    'checkOut', 'checkOutLocation', 'checkOutFacePhotoUrl',
+                    'checkOutPhotoUrl', 'workHours', 'hours', 'status',
+                    'checkOutFaceVerified',
+                ):
+                    if logs[0].get(key) is None and normalized.get(key) is not None:
+                        logs[0][key] = normalized.get(key)
+
+            normalized['timeLogs'] = logs
+
+        return normalized
+
     # Attendance Methods
     def get_attendance_records(self, user_id: str = None, date: str = None,
                                employee_id: str = None, start_date: str = None,
@@ -1231,6 +1472,7 @@ class FirebaseService:
                     u = self.get_user(uid)
                     if u:
                         user_map[uid] = u
+                settings = self.get_settings()
 
                 records = []
                 for doc in docs:
@@ -1247,9 +1489,12 @@ class FirebaseService:
                         continue
 
                     student_id = record_data.get('userId')
-                    if student_id and student_id in user_map:
-                        student = user_map[student_id]
+                    student = user_map.get(student_id) if student_id else None
+                    if student:
                         record_data['employeeName'] = student.get('name', 'Unknown')
+                    record_data = self.normalize_attendance_record(
+                        record_data, student=student, settings=settings
+                    )
 
                     records.append(record_data)
 
@@ -1264,12 +1509,17 @@ class FirebaseService:
                 if date:
                     records = [r for r in records if r.get('date') == date]
                 
-                # Add student names
-                for record in records:
+                # Add student names and normalize legacy session logs
+                settings = self.get_settings()
+                for index, record in enumerate(records):
                     self.hydrate_attendance_photos(record)
                     student_id = record.get('userId')
-                    if student_id and student_id in self.users_db:
-                        record['employeeName'] = self.users_db[student_id].get('name', 'Unknown')
+                    student = self.users_db.get(student_id) if student_id else None
+                    if student:
+                        record['employeeName'] = student.get('name', 'Unknown')
+                    records[index] = self.normalize_attendance_record(
+                        record, student=student, settings=settings
+                    )
                 
                 return records
         except Exception as e:
@@ -1281,19 +1531,74 @@ class FirebaseService:
         try:
             if self.db:
                 attendance_ref = self.db.collection('attendance')
-                query = attendance_ref.where('userId', '==', user_id).where('date', '==', date).limit(1)
+                query = (
+                    attendance_ref
+                    .where('userId', '==', user_id)
+                    .where('date', '==', date)
+                    .limit(10)
+                )
                 results = query.get()
-                
+                student = self.get_user(user_id)
+                settings = self.get_settings()
+
+                best_data = None
+                best_key = None
                 for doc in results:
-                    record_data = doc.to_dict()
+                    record_data = doc.to_dict() or {}
                     record_data['id'] = doc.id
-                    return self.hydrate_attendance_photos(record_data)
-                return None
+                    normalized = self.normalize_attendance_record(
+                        record_data, student=student, settings=settings
+                    )
+                    logs = normalized.get('timeLogs') or []
+                    has_open = any(
+                        isinstance(e, dict) and e.get('checkIn') and not e.get('checkOut')
+                        for e in logs
+                    )
+                    key = (
+                        len(logs) if isinstance(logs, list) else 0,
+                        1 if has_open else 0,
+                        str(normalized.get('updatedAt') or normalized.get('createdAt') or ''),
+                    )
+                    if best_key is None or key > best_key:
+                        best_key = key
+                        best_data = normalized
+
+                if best_data is None:
+                    return None
+
+                best_data = self.hydrate_attendance_photos(best_data)
+                return best_data
             else:
-                for record in self.attendance_db.values():
-                    if record.get('userId') == user_id and record.get('date') == date:
-                        return self.hydrate_attendance_photos(record)
-                return None
+                matches = [
+                    record for record in self.attendance_db.values()
+                    if record.get('userId') == user_id and record.get('date') == date
+                ]
+                if not matches:
+                    return None
+                student = self.users_db.get(user_id)
+                settings = self.get_settings()
+                best = None
+                best_key = None
+                for record in matches:
+                    normalized = self.normalize_attendance_record(
+                        record, student=student, settings=settings
+                    )
+                    logs = normalized.get('timeLogs') or []
+                    has_open = any(
+                        isinstance(e, dict) and e.get('checkIn') and not e.get('checkOut')
+                        for e in logs
+                    )
+                    key = (
+                        len(logs) if isinstance(logs, list) else 0,
+                        1 if has_open else 0,
+                        str(normalized.get('updatedAt') or normalized.get('createdAt') or ''),
+                    )
+                    if best_key is None or key > best_key:
+                        best_key = key
+                        best = normalized
+                record = best
+                record = self.hydrate_attendance_photos(record)
+                return record
         except Exception as e:
             print(f"Error getting today's attendance: {e}")
             return None
@@ -1306,11 +1611,25 @@ class FirebaseService:
                 if doc.exists:
                     record_data = doc.to_dict()
                     record_data['id'] = doc.id
-                    return self.hydrate_attendance_photos(record_data)
+                    record_data = self.hydrate_attendance_photos(record_data)
+                    user_id = record_data.get('userId')
+                    return self.normalize_attendance_record(
+                        record_data,
+                        student=self.get_user(user_id) if user_id else None,
+                        settings=self.get_settings(),
+                    )
                 return None
             else:
                 record = self.attendance_db.get(record_id)
-                return self.hydrate_attendance_photos(record) if record else None
+                if not record:
+                    return None
+                record = self.hydrate_attendance_photos(record)
+                user_id = record.get('userId')
+                return self.normalize_attendance_record(
+                    record,
+                    student=self.users_db.get(user_id) if user_id else None,
+                    settings=self.get_settings(),
+                )
         except Exception as e:
             print(f"Error getting attendance record: {e}")
             return None
@@ -1319,7 +1638,7 @@ class FirebaseService:
         """Create new attendance record"""
         try:
             if self.db:
-                doc_ref = self.db.collection('attendance').add(self._strip_none(record))
+                doc_ref = self.db.collection('attendance').add(self._strip_none(self._strip_base64_blobs(record)))
                 record['id'] = doc_ref[1].id
                 
                 return {
@@ -1342,7 +1661,145 @@ class FirebaseService:
                 'success': False,
                 'error': 'Failed to create attendance record'
             }
-    
+
+    def create_attendance_record_once(self, record: Dict, document_id: str = None) -> Dict:
+        """Create today's attendance document atomically.
+
+        The deterministic ``userId_date`` document ID prevents two concurrent
+        first check-ins from creating separate records for the same day.
+        """
+        try:
+            clean_record = self._strip_none(self._strip_base64_blobs(record))
+            record_id = document_id or f"{record.get('userId')}_{record.get('date')}"
+
+            if self.db:
+                doc_ref = self.db.collection('attendance').document(record_id)
+
+                @firestore.transactional
+                def _create_once(transaction):
+                    snapshot = transaction.get(doc_ref)
+                    if snapshot.exists:
+                        existing = snapshot.to_dict() or {}
+                        existing['id'] = snapshot.id
+                        return {
+                            'success': False,
+                            'conflict': True,
+                            'record': existing,
+                        }
+                    transaction.set(doc_ref, clean_record)
+                    return {
+                        'success': True,
+                        'record': {**clean_record, 'id': record_id},
+                    }
+
+                return _create_once(self.db.transaction())
+
+            for existing_id, existing in self.attendance_db.items():
+                if (existing.get('userId') == record.get('userId')
+                        and existing.get('date') == record.get('date')):
+                    return {
+                        'success': False,
+                        'conflict': True,
+                        'record': {**existing, 'id': existing_id},
+                    }
+            self.attendance_db[record_id] = clean_record
+            return {
+                'success': True,
+                'record': {**clean_record, 'id': record_id},
+            }
+        except Exception as e:
+            print(f"Error creating attendance record once: {e}")
+            return {
+                'success': False,
+                'error': 'Failed to create attendance record'
+            }
+
+    def mutate_attendance_record(self, record_id: str, mutator) -> Dict:
+        """Atomically read, validate, and update an attendance record.
+
+        ``mutator`` receives the current document and must return either:
+        - a dict of Firestore fields to update, or
+        - ``{'_error': 'message'}`` to reject the operation.
+        """
+        try:
+            if self.db:
+                doc_ref = self.db.collection('attendance').document(record_id)
+
+                @firestore.transactional
+                def _mutate(transaction):
+                    snapshot = transaction.get(doc_ref)
+                    if not snapshot.exists:
+                        return {'success': False, 'error': 'Record not found'}
+
+                    current = snapshot.to_dict() or {}
+                    current['id'] = snapshot.id
+                    mutation = mutator(current)
+                    if not isinstance(mutation, dict):
+                        return {'success': False, 'error': 'Invalid attendance update'}
+
+                    route_error = mutation.get('_error')
+                    if route_error:
+                        return {'success': False, 'error': route_error}
+
+                    update_data = {
+                        key: value for key, value in mutation.items()
+                        if key != '_error'
+                    }
+                    if not update_data:
+                        return {'success': False, 'error': 'No attendance changes'}
+
+                    clean_update = self._strip_none(
+                        self._strip_base64_blobs(update_data)
+                    )
+                    transaction.update(doc_ref, clean_update)
+
+                    merged = dict(current)
+                    for key, value in update_data.items():
+                        if value is firestore.DELETE_FIELD:
+                            merged.pop(key, None)
+                        else:
+                            merged[key] = value
+                    merged['id'] = snapshot.id
+                    merged = self.hydrate_attendance_photos(merged)
+                    return {'success': True, 'record': merged}
+
+                return _mutate(self.db.transaction())
+
+            if record_id not in self.attendance_db:
+                return {'success': False, 'error': 'Record not found'}
+
+            current = dict(self.attendance_db[record_id])
+            current['id'] = record_id
+            mutation = mutator(current)
+            if not isinstance(mutation, dict):
+                return {'success': False, 'error': 'Invalid attendance update'}
+            route_error = mutation.get('_error')
+            if route_error:
+                return {'success': False, 'error': route_error}
+
+            update_data = {
+                key: value for key, value in mutation.items()
+                if key != '_error'
+            }
+            if not update_data:
+                return {'success': False, 'error': 'No attendance changes'}
+
+            update_data = self._strip_none(self._strip_base64_blobs(update_data))
+            current.update(update_data)
+            current.pop('id', None)
+            self.attendance_db[record_id] = current
+            current['id'] = record_id
+            return {
+                'success': True,
+                'record': self.hydrate_attendance_photos(current),
+            }
+        except Exception as e:
+            print(f"Error mutating attendance record: {e}")
+            return {
+                'success': False,
+                'error': 'Failed to update attendance record'
+            }
+
     def update_attendance_record(self, record_id: str, update_data: Dict) -> Dict:
         """Update attendance record"""
         try:
@@ -1356,7 +1813,7 @@ class FirebaseService:
                         'error': 'Record not found'
                     }
                 
-                doc_ref.update(self._strip_none(update_data))
+                doc_ref.update(self._strip_none(self._strip_base64_blobs(update_data)))
                 
                 return {
                     'success': True,
@@ -1977,21 +2434,24 @@ class FirebaseService:
             }
     
     def mark_messages_read(self, conversation_id: str, user_id: str) -> Dict:
-        """Mark messages as read"""
+        """Mark messages as read.
+
+        Uses only conversationId == conversation_id and read == False in the
+        Firestore query to avoid requiring a composite index.  The senderId
+        filter is applied in Python after fetching the documents.
+        """
         try:
             if self.db:
                 messages_ref = self.db.collection('messages')
-                query = messages_ref.where('conversationId', '==', conversation_id).where('senderId', '!=', user_id).where('read', '==', False)
-                
+                query = messages_ref.where('conversationId', '==', conversation_id).where('read', '==', False)
                 for doc in query.get():
-                    doc.reference.update({'read': True})
-                
+                    if doc.to_dict().get('senderId') != user_id:
+                        doc.reference.update({'read': True})
                 return {'success': True}
             else:
                 for msg in self.messages_db.values():
                     if msg.get('conversationId') == conversation_id and msg.get('senderId') != user_id:
                         msg['read'] = True
-                
                 return {'success': True}
         except Exception as e:
             print(f"Error marking messages as read: {e}")
@@ -2048,6 +2508,9 @@ class FirebaseService:
             print(f"Error deleting broadcast: {e}")
             return {'success': False, 'error': str(e)}
 
+    # NOTE: get_unread_message_count is kept for backward compatibility but is no
+    # longer called from the frontend after the Bug 2 fix.  The badge is now
+    # driven by getConversations() counting hasUnread === true entries.
     def get_unread_message_count(self, user_id: str) -> int:
         """Get count of unread messages"""
         try:
@@ -2253,6 +2716,51 @@ class FirebaseService:
                 'success': False,
                 'error': 'Failed to update settings'
             }
+
+    def get_supervisor_schedule(self, supervisor_id: str) -> Dict:
+        """Get a supervisor's OJT schedule.
+
+        Returns {startTime, endTime, lateThreshold, ...} or {} when no
+        schedule has been saved yet (callers fall back to global settings).
+        """
+        try:
+            if self.db:
+                doc = self.db.collection('supervisor_schedules').document(supervisor_id).get()
+                if doc.exists:
+                    return doc.to_dict() or {}
+                return {}
+            else:
+                return dict(self.supervisor_schedules_db.get(supervisor_id, {}))
+        except Exception as e:
+            print(f"Error getting supervisor schedule: {e}")
+            return {}
+
+    def save_supervisor_schedule(self, supervisor_id: str, data: Dict) -> Dict:
+        """Persist a supervisor's OJT schedule (startTime/endTime/lateThreshold)."""
+        try:
+            payload = {
+                'startTime': data.get('startTime'),
+                'endTime': data.get('endTime'),
+                'lateThreshold': data.get('lateThreshold'),
+                'updatedAt': datetime.now().isoformat(),
+                'supervisorId': supervisor_id,
+            }
+            if self.db:
+                doc_ref = self.db.collection('supervisor_schedules').document(supervisor_id)
+                try:
+                    doc_ref.update(payload)
+                except Exception as update_err:
+                    if 'NOT_FOUND' in str(update_err) or '404' in str(update_err):
+                        doc_ref.set(payload, merge=True)
+                    else:
+                        raise
+                return {'success': True, 'schedule': payload}
+            else:
+                self.supervisor_schedules_db[supervisor_id] = payload
+                return {'success': True, 'schedule': payload}
+        except Exception as e:
+            print(f"Error saving supervisor schedule: {e}")
+            return {'success': False, 'error': 'Failed to save supervisor schedule'}
 
     # Task Methods
     def get_tasks_for_user(self, user_id: str) -> List[Dict]:
@@ -2482,14 +2990,48 @@ class FirebaseService:
             return []
 
     def get_company(self, company_id: str) -> Optional[Dict]:
-        """Get a single company by ID"""
+        """Get a single company by ID.
+        Checks 'companies' first, then 'hte_profiles', then name-based search
+        so that supervisors always find their company regardless of which
+        collection it lives in or how its ID was stored.
+        """
         try:
             if self.db:
+                # 1. Try companies collection
                 doc = self.db.collection('companies').document(company_id).get()
                 if doc.exists:
                     company_data = doc.to_dict()
                     company_data['id'] = doc.id
+                    company_data['_source'] = 'companies'
                     return company_data
+
+                # 2. Try hte_profiles collection
+                print(f"[get_company] ID '{company_id}' not in companies — trying hte_profiles")
+                doc2 = self.db.collection('hte_profiles').document(company_id).get()
+                if doc2.exists:
+                    hte_data = doc2.to_dict()
+                    hte_data['id'] = doc2.id
+                    hte_data['_source'] = 'hte_profiles'
+                    hte_data.setdefault('name', hte_data.get('name', ''))
+                    hte_data.setdefault('address', hte_data.get('location', ''))
+                    hte_data.setdefault('internCapacity', hte_data.get('totalSlots', 0))
+                    print(f"[get_company] Found '{hte_data.get('name')}' in hte_profiles")
+                    return hte_data
+
+                # 3. Scan hte_profiles for a doc whose stored 'id' field matches
+                #    (handles cases where the id field inside the doc differs from doc.id)
+                print(f"[get_company] ID '{company_id}' not found by doc ID — scanning hte_profiles by field")
+                for hdoc in self.db.collection('hte_profiles').get():
+                    h = hdoc.to_dict()
+                    if h.get('id') == company_id:
+                        h['id'] = hdoc.id  # use the real Firestore doc ID
+                        h['_source'] = 'hte_profiles'
+                        h.setdefault('address', h.get('location', ''))
+                        h.setdefault('internCapacity', h.get('totalSlots', 0))
+                        print(f"[get_company] Found '{h.get('name')}' in hte_profiles by field scan")
+                        return h
+
+                print(f"[get_company] ID '{company_id}' not found in either collection")
                 return None
             return self.companies_db.get(company_id) if hasattr(self, 'companies_db') else None
         except Exception as e:
@@ -3038,15 +3580,14 @@ class FirebaseService:
     def _auto_assign_supervisor(self, student_id: str, hte_id: str = None, hte: Dict = None) -> None:
         """
         Automatically assign a supervisor to a student based on the assigned HTE.
-        Uses the supervisor field from the HTE profile or company record.
-        Skips if the student already has a supervisor assigned.
+        Priority:
+          1. HTE's supervisorId (pre-resolved during Excel upload) — use directly.
+          2. HTE's supervisor name — search users by name.
+        Overwrites any previously assigned supervisor so the HTE-linked account
+        always wins.
         """
-        # Skip if student already has a supervisor
         student = self.get_user(student_id)
         if not student:
-            return
-        if student.get('supervisorId') or student.get('supervisorName'):
-            print(f"[auto-supervisor] Student {student_id} already has supervisor — skipping")
             return
 
         # Get HTE data if not provided
@@ -3059,16 +3600,34 @@ class FirebaseService:
                 print(f"[auto-supervisor] No HTE found for student {student_id}")
                 return
 
-        # Get supervisor from HTE
+        # ── 1. Use pre-resolved supervisorId from the HTE record ─────────────
+        supervisor_id = (hte.get('supervisorId') or '').strip()
+        if supervisor_id:
+            supervisor = self.get_user(supervisor_id)
+            if supervisor:
+                print(f"[auto-supervisor] Using pre-linked supervisor '{supervisor.get('name')}' ({supervisor_id}) for student {student_id}")
+                self.update_user(student_id, {
+                    'supervisorId':   supervisor_id,
+                    'supervisorName': supervisor.get('name', ''),
+                })
+                return
+            else:
+                print(f"[auto-supervisor] supervisorId '{supervisor_id}' from HTE not found in users, falling back to name search")
+
+        # ── 2. Fall back to name-based search ────────────────────────────────
+        # Skip if student already has a supervisor and HTE has no ID override
+        if student.get('supervisorId') or student.get('supervisorName'):
+            print(f"[auto-supervisor] Student {student_id} already has supervisor and HTE has no supervisorId — skipping")
+            return
+
         supervisor_name = (hte.get('supervisor') or
-                          hte.get('contactPerson') or
-                          hte.get('supervisorName') or '').strip()
+                           hte.get('contactPerson') or
+                           hte.get('supervisorName') or '').strip()
 
         if not supervisor_name:
             print(f"[auto-supervisor] No supervisor found in HTE '{hte.get('name')}' for student {student_id}")
             return
 
-        # Find the supervisor user record
         supervisor = None
         try:
             if self.db:
@@ -3087,7 +3646,7 @@ class FirebaseService:
             print(f"[auto-supervisor] Error finding supervisor by name: {e}")
 
         if supervisor:
-            print(f"[auto-supervisor] Assigning HTE supervisor {supervisor.get('name')} to student {student_id}")
+            print(f"[auto-supervisor] Assigning HTE supervisor '{supervisor.get('name')}' to student {student_id} via name match")
             self.update_user(student_id, {
                 'supervisorId':   supervisor.get('id'),
                 'supervisorName': supervisor.get('name'),
@@ -3098,60 +3657,101 @@ class FirebaseService:
     def _auto_assign_adviser(self, student_id: str, hte_id: str = None) -> None:
         """
         Automatically assign an adviser to a student.
-        If hte_id is provided, use the adviser assigned to that HTE company.
-        Otherwise, fall back to load-balancing (least-loaded active adviser).
-        Skips if the student already has an adviser assigned.
+        Priority:
+          1. HTE's adviserId (pre-resolved during Excel upload) — use directly.
+          2. HTE's adviser name — search users by name.
+          3. Load-balanced assignment when HTE has no adviser at all.
+        Always overrides the student's adviser with the HTE-linked account
+        when an adviserId is present.
         """
-        # Skip if student already has an adviser
         student = self.get_user(student_id)
         if not student:
             return
-        if student.get('adviserId') or student.get('adviserName'):
-            print(f"[auto-adviser] Student {student_id} already has adviser — skipping")
-            return
 
-        # Try to get adviser from the assigned HTE
+        # Try to get adviser from the assigned HTE first
+        hte_adviser_name = None
+        hte_adviser_id = None
         if hte_id:
             hte = self.get_hte_profile(hte_id)
             if not hte:
                 hte = self.get_company(hte_id)
-            
             if hte:
-                # Check if HTE has an assigned adviser
-                adviser_name = hte.get('adviser') or hte.get('adviserName') or hte.get('assignedAdviser')
-                adviser_id = hte.get('adviserId') or hte.get('assignedAdviserId')
-                
-                if adviser_name:
-                    # Find the adviser user record
-                    adviser = None
-                    try:
-                        if self.db:
-                            for doc in self.db.collection('users').where('role', '==', 'adviser').get():
-                                d = doc.to_dict()
-                                d['id'] = doc.id
-                                if d.get('name', '').strip().lower() == adviser_name.strip().lower():
-                                    adviser = d
-                                    break
-                        else:
-                            for u in (self.users_db or {}).values():
-                                if u.get('role') == 'adviser' and u.get('name', '').strip().lower() == adviser_name.strip().lower():
-                                    adviser = dict(u)
-                                    break
-                    except Exception as e:
-                        print(f"[auto-adviser] Error finding adviser by name: {e}")
-                    
-                    if adviser:
-                        print(f"[auto-adviser] Assigning HTE adviser {adviser.get('name')} to student {student_id}")
-                        self.update_user(student_id, {
-                            'adviserId':   adviser.get('id', adviser_id),
-                            'adviserName': adviser.get('name', adviser_name),
-                        })
-                        return
-                    else:
-                        print(f"[auto-adviser] HTE adviser '{adviser_name}' not found in users, falling back to load-balancing")
+                hte_adviser_name = hte.get('adviser') or hte.get('adviserName') or hte.get('assignedAdviser')
+                hte_adviser_id = (hte.get('adviserId') or hte.get('assignedAdviserId') or '').strip()
 
-        # Fallback: load-balanced adviser assignment
-        # Fetch all advisers
+                # If adviserId is missing, resolve by name across both collections
+                if hte_adviser_name and not hte_adviser_id:
+                    try:
+                        hte_name_key = (hte.get('name') or '').strip().lower()
+                        adv_key = hte_adviser_name.strip().lower()
+                        all_u = self.get_all_users()
+                        for u in all_u:
+                            if (u.get('role') or '').lower() == 'adviser' and \
+                               (u.get('name') or '').strip().lower() == adv_key:
+                                hte_adviser_id = u.get('id', '')
+                                # Persist so future calls don't need to resolve again
+                                try:
+                                    self.update_company(hte_id, {'adviserId': hte_adviser_id})
+                                except Exception:
+                                    pass
+                                try:
+                                    self.update_hte_profile(hte_id, {'adviserId': hte_adviser_id})
+                                except Exception:
+                                    pass
+                                print(f"[auto-adviser] Resolved adviserId by name: '{hte_adviser_name}' → {hte_adviser_id}")
+                                break
+                    except Exception as resolve_err:
+                        print(f"[auto-adviser] Name-resolve error: {resolve_err}")
+
+        # ── 1. Use pre-resolved adviserId from the HTE record ────────────────
+        if hte_adviser_id:
+            adviser = self.get_user(hte_adviser_id)
+            if adviser:
+                print(f"[auto-adviser] Using pre-linked adviser '{adviser.get('name')}' ({hte_adviser_id}) for student {student_id}")
+                self.update_user(student_id, {
+                    'adviserId':   hte_adviser_id,
+                    'adviserName': adviser.get('name', hte_adviser_name or ''),
+                })
+                return
+            else:
+                print(f"[auto-adviser] adviserId '{hte_adviser_id}' from HTE not found in users, falling back to name search")
+
+        # ── 2. Use HTE's adviser name to search users ─────────────────────────
+        if hte_adviser_name:
+            adviser = None
+            try:
+                if self.db:
+                    for doc in self.db.collection('users').where('role', '==', 'adviser').get():
+                        d = doc.to_dict()
+                        d['id'] = doc.id
+                        if d.get('name', '').strip().lower() == hte_adviser_name.strip().lower():
+                            adviser = d
+                            break
+                else:
+                    for u in (self.users_db or {}).values():
+                        if u.get('role') == 'adviser' and u.get('name', '').strip().lower() == hte_adviser_name.strip().lower():
+                            adviser = dict(u)
+                            break
+            except Exception as e:
+                print(f"[auto-adviser] Error finding adviser by name: {e}")
+
+            if adviser:
+                print(f"[auto-adviser] Assigning HTE adviser '{adviser.get('name')}' to student {student_id} (overrides any prior adviser)")
+                self.update_user(student_id, {
+                    'adviserId':   adviser.get('id', hte_adviser_id),
+                    'adviserName': adviser.get('name', hte_adviser_name),
+                })
+                return
+            else:
+                print(f"[auto-adviser] HTE adviser '{hte_adviser_name}' not found in users, falling back to load-balancing")
+        else:
+            # HTE has no adviser — skip if student already has one assigned
+            # (don't override a properly-assigned adviser with nothing)
+            if student.get('adviserId') or student.get('adviserName'):
+                print(f"[auto-adviser] Student {student_id} already has adviser and HTE has none — skipping")
+                return
+
+        # ── 3. Fallback: load-balanced adviser assignment ─────────────────────
         advisers: List[Dict] = []
         try:
             if self.db:
@@ -3191,7 +3791,7 @@ class FirebaseService:
 
         # Pick the adviser with the minimum load
         best_adviser = min(advisers, key=lambda a: load.get(a['id'], 0))
-        print(f"[auto-adviser] Assigning load-balanced adviser {best_adviser.get('name')} (load={load.get(best_adviser['id'], 0)}) to student {student_id}")
+        print(f"[auto-adviser] Assigning load-balanced adviser '{best_adviser.get('name')}' (load={load.get(best_adviser['id'], 0)}) to student {student_id}")
 
         self.update_user(student_id, {
             'adviserId':   best_adviser['id'],
@@ -3302,8 +3902,17 @@ class FirebaseService:
                 hte_skills = [x.strip().lower() for x in (hte.get('requiredSkills') or []) if x.strip()]
                 if student_skills:
                     if hte_skills:
-                        if any(s in hte_skills for s in student_skills):
-                            score += 2
+                        matched_skills = 0
+                        for s in student_skills:
+                            s_words = [w for w in s.split() if len(w) >= 3]
+                            for hs in hte_skills:
+                                hs_words = [w for w in hs.split() if len(w) >= 3]
+                                # Exact match or any word overlap
+                                if s == hs or any(w in hs for w in s_words) or any(w in s for w in hs_words):
+                                    matched_skills += 1
+                                    break
+                        if matched_skills > 0:
+                            score += 2 + matched_skills  # more matched skills = higher score
                     else:
                         if any(s in hte_text for s in student_skills):
                             score += 1
@@ -3332,12 +3941,8 @@ class FirebaseService:
                 if slots > 0:
                     score += 1
 
-                # ── Guaranteed minimum for companies ────────────────────
-                # Any active partner company is always a valid candidate.
-                # This ensures students are never left unassigned just because
-                # companies lack structured metadata fields.
-                if source == 'companies' and has_any_content:
-                    score = max(score, 1)
+                # (Guaranteed minimum score removed — companies must earn a score
+                #  via skill/course/interest matching like any other candidate.)
 
                 # ── Name keyword bonus ───────────────────────────────────
                 keywords = []
@@ -3361,19 +3966,14 @@ class FirebaseService:
             # Sort by score descending, then slots descending
             scored.sort(key=lambda x: (x[0], int(x[1].get('availableSlots', 999))), reverse=True)
 
-            # Best match: highest score >= 1
+            # Best match: must have meaningful content match (score > 1 means beyond just slots bonus)
             best_score, best_hte = scored[0]
-            if best_score >= 1:
+            if best_score > 1:
                 print(f"[auto-match] Winner: '{best_hte.get('name')}' score={best_score}")
                 return best_hte
 
-            # ── FALLBACK: just use first active company/hte ──────────────
-            # If every candidate scored 0 (completely empty plan), pick
-            # the first active one rather than returning None.
-            print("[auto-match] All scores=0, using fallback: first active candidate")
-            for _, hte in scored:
-                return hte
-
+            # No meaningful skills/interests/course matched any HTE
+            print(f"[auto-match] No meaningful skill match found (best score={best_score}) — returning None")
             return None
 
         except Exception as e:
@@ -3464,6 +4064,37 @@ class FirebaseService:
                     slot_result = self.update_hte_profile(hte_id, {'availableSlots': slots - 1})
                     if not slot_result.get('success'):
                         return slot_result
+
+                    # ── Also sync slot counts in the matching companies document ─
+                    try:
+                        cmp_name_key = (hte_name or '').strip().lower()
+                        companies_list = self.get_companies() if cmp_name_key else []
+                        for cmp in companies_list:
+                            if (cmp.get('name') or '').strip().lower() == cmp_name_key:
+                                cmp_id = cmp.get('id', '')
+                                if not cmp_id:
+                                    break
+                                cmp_slots = cmp.get('availableSlots')
+                                try:
+                                    cmp_slots = int(cmp_slots) if cmp_slots is not None else 0
+                                except (TypeError, ValueError):
+                                    cmp_slots = 0
+                                cmp_interns = cmp.get('internCount')
+                                try:
+                                    cmp_interns = int(cmp_interns) if cmp_interns is not None else 0
+                                except (TypeError, ValueError):
+                                    cmp_interns = 0
+                                new_cmp_slots = max(0, cmp_slots - 1)
+                                cmp_update = {
+                                    'availableSlots': new_cmp_slots,
+                                    'internCount': cmp_interns + 1,
+                                }
+                                if new_cmp_slots == 0:
+                                    cmp_update['status'] = 'full'
+                                self.update_company(cmp_id, cmp_update)
+                                break
+                    except Exception as cmp_sync_err:
+                        print(f"[assign] Warning: companies slot sync failed: {cmp_sync_err}")
             # ── Capacity check for companies collection ───────────────────
             elif source == 'companies':
                 capacity = hte.get('internCapacity') or hte.get('totalSlots') or 0
@@ -3509,20 +4140,69 @@ class FirebaseService:
                 'assignedAt': datetime.now().isoformat(),
                 'assignedBy': assigned_by,
             }
+
+            # ── Add match metadata to plan document ─────────────────────
+            hte_required_skills = hte.get('requiredSkills') or []
+            supervisor_name_val = hte.get('supervisor') or hte.get('supervisorName') or ''
+            supervisor_id_val   = hte.get('supervisorId') or ''
+            adviser_name_val    = hte.get('adviser') or hte.get('adviserName') or ''
+            adviser_id_val      = hte.get('adviserId') or ''
+
+            # ── Fallback: resolve IDs by name if missing ──────────────────
+            if supervisor_name_val and not supervisor_id_val:
+                try:
+                    all_u = self.get_all_users()
+                    sup_key = supervisor_name_val.strip().lower()
+                    for u in all_u:
+                        if (u.get('role') or '').lower() == 'supervisor' and \
+                           (u.get('name') or '').strip().lower() == sup_key:
+                            supervisor_id_val = u.get('id', '')
+                            break
+                    if supervisor_id_val:
+                        print(f"[assign] Resolved supervisorId by name: '{supervisor_name_val}' → {supervisor_id_val}")
+                except Exception:
+                    pass
+
+            if adviser_name_val and not adviser_id_val:
+                try:
+                    all_u = self.get_all_users()
+                    adv_key = adviser_name_val.strip().lower()
+                    for u in all_u:
+                        if (u.get('role') or '').lower() == 'adviser' and \
+                           (u.get('name') or '').strip().lower() == adv_key:
+                            adviser_id_val = u.get('id', '')
+                            break
+                    if adviser_id_val:
+                        print(f"[assign] Resolved adviserId by name: '{adviser_name_val}' → {adviser_id_val}")
+                        # Also persist the resolved ID back to the company/HTE record
+                        try:
+                            if source == 'companies':
+                                self.update_company(hte_id, {'adviserId': adviser_id_val, 'adviserName': adviser_name_val})
+                            else:
+                                self.update_hte_profile(hte_id, {'adviserId': adviser_id_val})
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            # Fetch the plan to get the student's skills for score calculation
+            existing_plan = self.get_application_plan(plan_id) or {}
+            plan_skills = [s.strip().lower() for s in (existing_plan.get('skills') or []) if s.strip()]
+            hte_skills_lower = [s.strip().lower() for s in hte_required_skills if s.strip()]
+            matched_skills_count = sum(1 for s in plan_skills if s in hte_skills_lower)
+            match_score = round((matched_skills_count / max(len(hte_required_skills), 1)) * 100)
+
+            plan_update['matchScore'] = match_score
+            plan_update['assignedHteSkills'] = hte_required_skills
+            plan_update['supervisorName'] = supervisor_name_val
+            plan_update['supervisorId']   = supervisor_id_val
+            plan_update['adviserName'] = adviser_name_val
+            plan_update['adviserId']   = adviser_id_val
             plan_result = self.update_application_plan(plan_id, plan_update)
             if not plan_result.get('success'):
                 return plan_result
 
             updated_plan = plan_result['plan']
-
-            # ── Get supervisor and adviser info for the plan response ───────
-            supervisor_name = hte.get('supervisor') or hte.get('contactPerson') or ''
-            adviser_name = hte.get('adviser') or ''
-
-            if supervisor_name:
-                updated_plan['supervisorName'] = supervisor_name
-            if adviser_name:
-                updated_plan['adviserName'] = adviser_name
 
             # ── Sync company assignment to the student's user record ───────
             student_id = updated_plan.get('studentId', '')

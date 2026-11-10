@@ -543,10 +543,35 @@ def record_checkin():
             attendance_status = 'present'  # should not reach here after outside-session block above
 
         print(f"[CHECK-IN] session={session} now={now_ph.strftime('%H:%M')} status={attendance_status}")
+
+        # ── Official check-in time normalization ──────────────────────────────
+        # If student arrives EARLY (before scheduled time), snap to scheduled time.
+        # If on-time or late, record actual time.
+        # Preserve actual timestamp in actualCheckIn for audit.
+        actual_checkin_iso = now_iso
+        scheduled_ci_total = _t(session_checkin_str)
+        if now_total < scheduled_ci_total:
+            # Early arrival — snap to scheduled check-in time
+            scheduled_ci_dt = now_ph.replace(
+                hour=scheduled_ci_total // 60,
+                minute=scheduled_ci_total % 60,
+                second=0, microsecond=0
+            ) - PH_TZ_OFFSET  # convert back to UTC
+            official_checkin_iso = scheduled_ci_dt.isoformat()
+        else:
+            # On-time or late — record actual
+            official_checkin_iso = now_iso
+
+        # Also store scheduled checkout time for normalization at checkout
+        session_checkout_str = morning_checkout_str if session == 'morning' else afternoon_checkout_str
+
     except Exception as e:
         print(f"[CHECK-IN] schedule detection failed: {e}")
         session = 'morning'
         attendance_status = 'present'
+        official_checkin_iso = now_iso
+        actual_checkin_iso = now_iso
+        session_checkout_str = '12:00'
     # ─────────────────────────────────────────────────────────────────────────
 
     try:
@@ -565,7 +590,8 @@ def record_checkin():
     supervisor_id_val = (student.get('supervisorId') if student else None) or ''
 
     new_log_entry = {
-        'checkIn':  now_iso,
+        'checkIn':       official_checkin_iso,
+        'actualCheckIn': actual_checkin_iso,
         'session':  session,
         'status':   attendance_status,
         'date':     today,
@@ -830,7 +856,31 @@ def record_checkout():
 
         entry = time_logs[open_idx]
         checkout_session = _log_session(entry) or 'morning'
-        entry['checkOut'] = check_out_iso
+
+        # ── Official check-out time normalization ─────────────────────────────
+        # Official checkout is always the scheduled checkout time.
+        # Actual time is preserved in actualCheckOut for audit.
+        actual_checkout_iso = check_out_iso
+        try:
+            _def_t = lambda hhmm: int(hhmm.split(':')[0]) * 60 + int(hhmm.split(':')[1])
+            if checkout_session == 'morning':
+                sched_co_str = (student.get('ojtMorningCheckoutTime') if student else None) or settings.get('ojtMorningCheckoutTime', '12:00')
+            else:
+                sched_co_str = (student.get('ojtAfternoonCheckoutTime') if student else None) or settings.get('ojtAfternoonCheckoutTime', '17:00')
+            sched_co_min = _def_t(sched_co_str)
+            co_ph = check_out_time + PH_TZ_OFFSET
+            sched_co_dt = co_ph.replace(
+                hour=sched_co_min // 60,
+                minute=sched_co_min % 60,
+                second=0, microsecond=0
+            ) - PH_TZ_OFFSET
+            official_checkout_iso = sched_co_dt.isoformat()
+        except Exception as _e:
+            print(f"[CHECK-OUT] normalization failed: {_e}, using actual time")
+            official_checkout_iso = check_out_iso
+
+        entry['checkOut']       = official_checkout_iso
+        entry['actualCheckOut'] = actual_checkout_iso
         entry['checkOutLocation'] = {
             'latitude':  latitude,
             'longitude': longitude,
@@ -846,7 +896,7 @@ def record_checkout():
         entry['locationDisabled']     = location_disabled
 
         session_hours = FirebaseService._hours_between(
-            entry.get('checkIn'), check_out_iso
+            entry.get('checkIn'), official_checkout_iso
         ) or 0.0
         entry['workHours'] = session_hours
         entry['hours'] = session_hours  # alias per spec
@@ -873,8 +923,9 @@ def record_checkout():
 
         update_data = {
             'timeLogs':             time_logs,
-            # Top-level checkOut = time of the most recent checkout (for backward compat)
-            'checkOut':             check_out_iso,
+            # Top-level checkOut = official (normalized) checkout time
+            'checkOut':             official_checkout_iso,
+            'actualCheckOut':       actual_checkout_iso,
             'checkOutLocation': {
                 'latitude':  latitude,
                 'longitude': longitude,

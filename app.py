@@ -32,6 +32,7 @@ from routes.evaluation_routes import evaluation_bp, set_firebase_service as set_
 from routes.rules_routes import rules_bp, set_firebase_service as set_rules_firebase
 from routes.application_plan_routes import application_plan_bp, set_firebase_service as set_application_plan_firebase
 from services.firebase_service import FirebaseService
+from services.absent_detector import AbsentDetectorService
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -84,6 +85,52 @@ app.register_blueprint(company_bp, url_prefix='/api/companies')
 app.register_blueprint(evaluation_bp, url_prefix='/api/evaluations')
 app.register_blueprint(rules_bp, url_prefix='/api/rules')
 app.register_blueprint(application_plan_bp, url_prefix='/api/application-plans')
+
+# ── Absent detector service ───────────────────────────────────────────────────
+try:
+    absent_detector = AbsentDetectorService(firebase_service)
+    absent_detector.start()
+except Exception as _absent_exc:
+    import logging as _logging
+    _logging.warning(f'[app] AbsentDetectorService could not start: {_absent_exc}')
+
+# ── Update current user's name  PUT /api/profile/name ────────────────────────
+# Registered here (not inside user_bp) to avoid the /<user_id> route conflict.
+@app.route('/api/profile/name', methods=['PUT'])
+@jwt_required()
+def update_profile_name():
+    """Any authenticated user can update their own display name."""
+    current_user_id = get_jwt_identity()
+    data = request.get_json() or {}
+
+    first_name = data.get('first_name')
+    last_name  = data.get('last_name')
+    name_field = data.get('name')
+
+    if first_name is not None or last_name is not None:
+        full_name = (str(first_name or '').strip() + ' ' + str(last_name or '').strip()).strip()
+    elif name_field is not None:
+        full_name = str(name_field).strip()
+    else:
+        return jsonify({'error': 'first_name, last_name, or name is required'}), 400
+
+    if not full_name:
+        return jsonify({'error': 'Name must not be empty'}), 400
+
+    try:
+        user = firebase_service.get_user(current_user_id)
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        result = firebase_service.update_user(current_user_id, {'name': full_name})
+    except Exception as e:
+        return jsonify({'error': 'Database error', 'details': str(e)}), 500
+
+    if not result.get('success'):
+        return jsonify({'error': result.get('error', 'Failed to update name')}), 400
+
+    updated = result.get('user') or {}
+    updated.pop('password', None)
+    return jsonify(updated), 200
 
 # Dashboard Route
 @app.route('/api/dashboard/stats', methods=['GET'])

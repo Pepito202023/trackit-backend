@@ -10,6 +10,7 @@ from services.firebase_service import FirebaseService
 from services.email_service import (
     generate_temp_password,
     send_account_setup_email,
+    send_welcome_email,
     WEB_BASE_URL,
     smtp_session,
     last_email_error,
@@ -61,22 +62,25 @@ def _current_user_role(svc: FirebaseService) -> str:
 
 
 def _send_account_setup_email(svc: FirebaseService, user: dict) -> tuple:
-    """Email the user a one-time password setup link (no plaintext password).
+    """Generate a temp password, store it, and email the credentials to the user.
     Returns (sent: bool, error: str|None)."""
     email = (user.get('email') or '').strip()
     if not email:
         return False, 'User has no email address'
-    raw_token = svc.create_password_reset_token(email)
-    if not raw_token:
-        return False, 'Could not create setup token'
-    setup_link = f"{WEB_BASE_URL}/reset_password.html?token={raw_token}"
+    # Generate a fresh temp password
+    temp_pw = generate_temp_password()
+    # Hash and store it
+    user_id = user.get('id') or ''
+    if user_id:
+        try:
+            svc.set_user_password(user_id, temp_pw)
+            svc.db.collection('users').document(user_id).update({'_tempPw': temp_pw})
+        except Exception as _e:
+            print(f"[EMAIL SETUP] Could not store temp password: {_e}")
     try:
-        sent = send_account_setup_email(
-            email,
-            user.get('name') or 'User',
-            user.get('role') or 'user',
-            user.get('idNumber') or '',
-            setup_link,
+        sent = send_welcome_email(
+            {**user, 'idNumber': user.get('idNumber') or ''},
+            temp_pw,
         )
         if not sent:
             return False, last_email_error() or 'Email send failed'

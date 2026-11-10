@@ -693,6 +693,44 @@ def upload_hte_excel():
         companies_created = []
         row_num = 2  # Start from row 2 (skip header)
 
+        # ── Pre-load all users once for efficient name-based lookup ──────────
+        all_users = svc.get_all_users()
+        # Build lookup maps: normalised name → user dict, per role
+        supervisor_by_name = {}
+        adviser_by_name = {}
+        for u in all_users:
+            u_role = (u.get('role') or '').lower().strip()
+            u_name_key = (u.get('name') or '').strip().lower()
+            if not u_name_key:
+                continue
+            if u_role == 'supervisor':
+                supervisor_by_name[u_name_key] = u
+            elif u_role == 'adviser':
+                adviser_by_name[u_name_key] = u
+
+        def _resolve_user(name: str, role_map: dict, role_label: str):
+            """
+            Try to match a plain-text name to an existing user account.
+            Returns (user_id, user_name, warning_message).
+            """
+            if not name:
+                return None, None, None
+            key = name.strip().lower()
+            # Exact match
+            if key in role_map:
+                u = role_map[key]
+                return u.get('id'), u.get('name', name), None
+            # Partial / fuzzy: stored name contains the search key or vice-versa
+            for stored_key, u in role_map.items():
+                if key in stored_key or stored_key in key:
+                    return u.get('id'), u.get('name', name), (
+                        f"{role_label} '{name}' matched to '{u.get('name')}' (partial)"
+                    )
+            return None, name, (
+                f"{role_label} '{name}' not found in User Management — "
+                f"name saved as text only. Please create a {role_label} account first."
+            )
+
         for row in sheet.iter_rows(min_row=2, values_only=True):
             if not any(row):  # Skip empty rows
                 row_num += 1
@@ -702,25 +740,43 @@ def upload_hte_excel():
                 company_name = str(row[col_indices['Company Name']] or '').strip()
                 location = str(row[col_indices['Location']] or '').strip()
                 required_skills_str = str(row[col_indices['Required Skills']] or '').strip()
-                supervisor = str(row[col_indices['Supervisor']] or '').strip()
-                adviser = str(row[col_indices['Adviser']] or '').strip()
+                supervisor_name_raw = str(row[col_indices['Supervisor']] or '').strip()
+                adviser_name_raw = str(row[col_indices['Adviser']] or '').strip()
 
                 if not company_name:
                     failed.append({'row': row_num, 'error': 'Company Name is required'})
                     row_num += 1
                     continue
 
+                # ── Resolve Supervisor to an existing user account ────────
+                supervisor_id, supervisor_name, sup_warn = _resolve_user(
+                    supervisor_name_raw, supervisor_by_name, 'Supervisor'
+                )
+                if sup_warn:
+                    print(f"[HTE Excel upload] Row {row_num}: {sup_warn}")
+
+                # ── Resolve Adviser to an existing user account ───────────
+                adviser_id, adviser_name, adv_warn = _resolve_user(
+                    adviser_name_raw, adviser_by_name, 'Adviser'
+                )
+                if adv_warn:
+                    print(f"[HTE Excel upload] Row {row_num}: {adv_warn}")
+
                 # Parse skills (comma-separated)
                 required_skills = [s.strip() for s in required_skills_str.split(',') if s.strip()]
 
-                # Create HTE profile
+                # ── Build HTE profile with resolved IDs ───────────────────
                 hte = {
                     'name': company_name,
                     'location': location,
                     'address': location,
                     'requiredSkills': required_skills,
-                    'supervisor': supervisor,
-                    'adviser': adviser,
+                    # Supervisor — name + ID (ID may be None if not found)
+                    'supervisor': supervisor_name or supervisor_name_raw,
+                    'supervisorId': supervisor_id or '',
+                    # Adviser — name + ID (ID may be None if not found)
+                    'adviser': adviser_name or adviser_name_raw,
+                    'adviserId': adviser_id or '',
                     'availableSlots': 10,  # Default slots
                     'totalSlots': 10,
                     'status': 'active',
@@ -729,44 +785,83 @@ def upload_hte_excel():
 
                 result = svc.create_hte_profile(hte)
                 if result.get('success'):
+                    hte_doc_id = result['hte'].get('id')
+
+                    # ── Link the supervisor's user record back to this company ─
+                    if supervisor_id:
+                        try:
+                            svc.update_user(supervisor_id, {
+                                'companyId':   hte_doc_id,
+                                'companyName': company_name,
+                                'company':     company_name,
+                            })
+                            print(f"[HTE Excel upload] Linked supervisor '{supervisor_name}' ({supervisor_id}) → '{company_name}'")
+                        except Exception as sup_link_err:
+                            print(f"[HTE Excel upload] Could not link supervisor user: {sup_link_err}")
+
                     created.append({
                         'row': row_num,
                         'company': company_name,
-                        'id': result['hte'].get('id'),
+                        'id': hte_doc_id,
+                        'supervisorLinked': bool(supervisor_id),
+                        'adviserLinked': bool(adviser_id),
+                        'warnings': [w for w in (sup_warn, adv_warn) if w],
                     })
 
-                    # Also create a Partner Company entry
-                    # Check if company already exists
+                    # ── Sync to Partner Companies collection ──────────────
                     existing_companies = svc.get_companies()
-                    company_exists = any(
-                        (c.get('name') or '').strip().lower() == company_name.lower()
-                        for c in existing_companies
+                    matching_company = next(
+                        (c for c in existing_companies
+                         if (c.get('name') or '').strip().lower() == company_name.lower()),
+                        None
                     )
 
-                    if not company_exists:
-                        company_data = {
-                            'name': company_name,
-                            'address': location,
-                            'supervisor': supervisor,
-                            'adviser': adviser,
-                            'adviserName': adviser,
-                            'requiredSkills': required_skills,
-                            'contact': '',
-                            'status': 'active',
-                            'internCapacity': 10,
-                            'description': '',
-                        }
+                    company_data = {
+                        'name': company_name,
+                        'address': location,
+                        # Supervisor with ID
+                        'supervisor': supervisor_name or supervisor_name_raw,
+                        'supervisorId': supervisor_id or '',
+                        # Adviser with ID
+                        'adviser': adviser_name or adviser_name_raw,
+                        'adviserId': adviser_id or '',
+                        'adviserName': adviser_name or adviser_name_raw,
+                        'requiredSkills': required_skills,
+                        'contact': '',
+                        'status': 'active',
+                        'internCapacity': 10,
+                        'totalSlots': 10,
+                        'availableSlots': 10,
+                        'description': '',
+                    }
+
+                    if not matching_company:
                         company_result = svc.create_company(company_data)
                         if company_result.get('success'):
                             companies_created.append({
                                 'company': company_name,
                                 'id': company_result['company'].get('id'),
                             })
-                            print(f"[HTE Excel upload] Created partner company: {company_name}")
+                            print(f"[HTE Excel upload] Created partner company: {company_name} "
+                                  f"(supervisorId={supervisor_id}, adviserId={adviser_id})")
                         else:
                             print(f"[HTE Excel upload] Failed to create partner company: {company_name}")
                     else:
-                        print(f"[HTE Excel upload] Company already exists: {company_name}")
+                        # Update existing company so IDs are always in sync
+                        update_fields = {
+                            'supervisor':   supervisor_name or supervisor_name_raw,
+                            'supervisorId': supervisor_id or '',
+                            'adviser':      adviser_name or adviser_name_raw,
+                            'adviserId':    adviser_id or '',
+                            'adviserName':  adviser_name or adviser_name_raw,
+                        }
+                        if location:
+                            update_fields['address'] = location
+                        if required_skills:
+                            update_fields['requiredSkills'] = required_skills
+                        svc.update_company(matching_company['id'], update_fields)
+                        print(f"[HTE Excel upload] Updated existing company: {company_name} "
+                              f"(supervisorId={supervisor_id}, adviserId={adviser_id})")
                 else:
                     failed.append({
                         'row': row_num,
@@ -1296,3 +1391,137 @@ def delete_plan_template(template_id):
     if not result.get('success'):
         return jsonify({'error': result.get('error', 'Delete failed')}), 400
     return jsonify({'success': True}), 200
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SYNC ASSIGNMENTS  POST /api/application-plans/sync-assignments
+# Retroactively fills supervisorName, supervisorId, adviserName, adviserId
+# on all assigned plans that are missing those fields.
+# Also re-syncs the student user record.  Safe to call multiple times.
+# ─────────────────────────────────────────────────────────────────────────────
+@application_plan_bp.route('/sync-assignments', methods=['POST'])
+@jwt_required()
+def sync_assignments():
+    """
+    POST /api/application-plans/sync-assignments
+    Walk every 'assigned' plan, find its HTE, and stamp supervisorId/Name +
+    adviserId/Name onto the plan and the student's user record.
+    """
+    svc = _get_service()
+    current_user_id = get_jwt_identity()
+
+    caller = svc.get_user(current_user_id)
+    role = (caller or {}).get('role', 'student')
+    if role not in ('coordinator', 'chairman', 'admin'):
+        return jsonify({'error': 'Permission denied'}), 403
+
+    plans = svc.get_application_plans(status='assigned') or []
+    updated = []
+    skipped = []
+    failed  = []
+
+    for plan in plans:
+        plan_id   = plan.get('id', '')
+        hte_id    = plan.get('assignedHteId', '')
+        student_id = plan.get('studentId', '')
+        if not plan_id or not hte_id:
+            skipped.append({'planId': plan_id, 'reason': 'no hteId'})
+            continue
+
+        # Resolve HTE — works for both companies and hte_profiles
+        hte = svc.get_hte_profile(hte_id)
+        if not hte:
+            hte = svc.get_company(hte_id)
+        if not hte:
+            # Try by name
+            hte_name = plan.get('assignedHteName', '')
+            if hte_name:
+                for c in (svc.get_companies() or []):
+                    if (c.get('name') or '').strip().lower() == hte_name.strip().lower():
+                        hte = c
+                        break
+        if not hte:
+            skipped.append({'planId': plan_id, 'reason': f'HTE {hte_id!r} not found'})
+            continue
+
+        sup_name = (hte.get('supervisor') or hte.get('contactPerson') or '').strip()
+        sup_id   = (hte.get('supervisorId') or '').strip()
+        adv_name = (hte.get('adviser') or hte.get('adviserName') or '').strip()
+        adv_id   = (hte.get('adviserId') or '').strip()
+
+        # Resolve IDs by name if still missing
+        all_users_cache = getattr(svc, '_sync_users_cache', None)
+        if all_users_cache is None:
+            all_users_cache = svc.get_all_users()
+            svc._sync_users_cache = all_users_cache
+
+        if sup_name and not sup_id:
+            sup_key = sup_name.lower()
+            for u in all_users_cache:
+                if (u.get('role') or '').lower() == 'supervisor' and \
+                   (u.get('name') or '').strip().lower() == sup_key:
+                    sup_id = u.get('id', '')
+                    break
+
+        if adv_name and not adv_id:
+            adv_key = adv_name.lower()
+            for u in all_users_cache:
+                if (u.get('role') or '').lower() == 'adviser' and \
+                   (u.get('name') or '').strip().lower() == adv_key:
+                    adv_id = u.get('id', '')
+                    break
+
+        # Merge plan fields (plan may already have some values)
+        final_sup_name = sup_name or plan.get('supervisorName', '')
+        final_sup_id   = sup_id   or plan.get('supervisorId', '')
+        final_adv_name = adv_name or plan.get('adviserName', '')
+        final_adv_id   = adv_id   or plan.get('adviserId', '')
+
+        # Update plan if any field is missing
+        needs_plan_update = (
+            (final_sup_name and not plan.get('supervisorName')) or
+            (final_sup_id   and not plan.get('supervisorId'))   or
+            (final_adv_name and not plan.get('adviserName'))    or
+            (final_adv_id   and not plan.get('adviserId'))
+        )
+        if needs_plan_update:
+            plan_patch = {}
+            if final_sup_name: plan_patch['supervisorName'] = final_sup_name
+            if final_sup_id:   plan_patch['supervisorId']   = final_sup_id
+            if final_adv_name: plan_patch['adviserName']    = final_adv_name
+            if final_adv_id:   plan_patch['adviserId']      = final_adv_id
+            svc.update_application_plan(plan_id, plan_patch)
+
+        # Always patch the student user record with whatever we know
+        if student_id and (final_sup_name or final_sup_id or final_adv_name or final_adv_id):
+            student = svc.get_user(student_id) or {}
+            user_patch = {}
+            if final_sup_name and not student.get('supervisorName'): user_patch['supervisorName'] = final_sup_name
+            if final_sup_id   and not student.get('supervisorId'):   user_patch['supervisorId']   = final_sup_id
+            if final_adv_name and not student.get('adviserName'):    user_patch['adviserName']    = final_adv_name
+            if final_adv_id   and not student.get('adviserId'):      user_patch['adviserId']      = final_adv_id
+            if hte_id and not student.get('companyId'):              user_patch['companyId']      = hte_id
+            hte_name = hte.get('name', '')
+            if hte_name and not student.get('company'):
+                user_patch['company']     = hte_name
+                user_patch['companyName'] = hte_name
+            if user_patch:
+                try:
+                    svc.update_user(student_id, user_patch)
+                    updated.append({'planId': plan_id, 'student': plan.get('studentName', student_id), 'hte': hte_name, 'patched': list(user_patch.keys())})
+                except Exception as ue:
+                    print(f"[sync-assignments] Could not update user {student_id}: {ue}")
+                    failed.append({'planId': plan_id, 'error': str(ue)})
+            else:
+                skipped.append({'planId': plan_id, 'reason': 'student record already complete'})
+        else:
+            skipped.append({'planId': plan_id, 'reason': 'no assignment data available'})
+
+    print(f"[sync-assignments] updated={len(updated)}, skipped={len(skipped)}, failed={len(failed)}")
+    return jsonify({
+        'success': True,
+        'updated': updated,
+        'skipped': skipped,
+        'failed':  failed,
+        'summary': f"Updated {len(updated)} plan(s). {len(skipped)} already complete. {len(failed)} failed.",
+    }), 200

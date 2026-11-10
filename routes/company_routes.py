@@ -324,15 +324,45 @@ def set_company_capacity(company_id):
     Only the supervisor assigned to that company (or coordinator/chairman) may call this.
     Body: { "internCapacity": <int> }
     Validation: capacity must be >= current active intern count.
+    Works for both 'companies' and 'hte_profiles' collections.
     """
     from flask_jwt_extended import get_jwt_identity
     svc = _get_service()
     current_user_id = get_jwt_identity()
     data = request.get_json() or {}
 
+    # get_company now falls back to hte_profiles automatically
+    print(f"[set_capacity] company_id={company_id!r}")
     company = svc.get_company(company_id)
+    print(f"[set_capacity] company resolved: {company.get('name') if company else None}, source={company.get('_source') if company else 'NOT FOUND'}")
+
+    # Last resort: the stored companyId may be stale — find by supervisor's company name
+    if not company:
+        caller_pre = svc.get_user(get_jwt_identity())
+        if caller_pre:
+            fallback_name = (caller_pre.get('company') or caller_pre.get('companyName') or '').strip()
+            if fallback_name:
+                print(f"[set_capacity] Trying name-based fallback: '{fallback_name}'")
+                for cmp in (svc.get_companies() or []):
+                    if (cmp.get('name') or '').strip().lower() == fallback_name.lower():
+                        # Update the caller's companyId so next call uses the right ID
+                        try:
+                            svc.update_user(caller_pre['id'], {'companyId': cmp['id']})
+                        except Exception:
+                            pass
+                        company = cmp
+                        # Determine source from cmp data
+                        company['_source'] = cmp.get('source', 'hte_profiles') if cmp.get('source') == 'hte_profiles' else 'companies'
+                        # Re-resolve properly
+                        company = svc.get_company(cmp['id']) or company
+                        print(f"[set_capacity] Name fallback found: '{company.get('name')}' id={cmp['id']}")
+                        break
+
     if not company:
         return jsonify({'error': 'Company not found'}), 404
+
+    # Track which collection this record lives in
+    record_source = company.get('_source', 'companies')
 
     caller = svc.get_user(current_user_id)
     if not caller:
@@ -394,21 +424,39 @@ def set_company_capacity(company_id):
     available = max(0, new_capacity - occupied) if new_capacity > 0 else None
     new_status = 'full' if (new_capacity > 0 and occupied >= new_capacity) else 'active'
 
-    result = svc.update_company(company_id, {
+    capacity_fields = {
         'internCapacity': new_capacity,
         'totalSlots':     new_capacity,
         'availableSlots': available if available is not None else new_capacity,
         'status': new_status,
-    })
+    }
 
-    if result.get('success'):
+    # Update the correct collection
+    if record_source == 'hte_profiles':
+        result = svc.update_hte_profile(company_id, capacity_fields)
+        # Mirror the change to the matching companies record if one exists
+        try:
+            cmp_name_key = (company.get('name') or '').strip().lower()
+            if cmp_name_key:
+                for cmp in (svc.get_companies() or []):
+                    if (cmp.get('name') or '').strip().lower() == cmp_name_key:
+                        svc.update_company(cmp['id'], capacity_fields)
+                        break
+        except Exception as mirror_err:
+            print(f"[set_capacity] Mirror to companies failed (non-fatal): {mirror_err}")
+        success = result.get('success')
+    else:
+        result = svc.update_company(company_id, capacity_fields)
+        success = result.get('success')
+
+    if success:
         return jsonify({
-            'success':       True,
+            'success':        True,
             'internCapacity': new_capacity,
-            'occupied':      occupied,
-            'available':     available,
-            'isFull':        new_status == 'full',
-            'status':        new_status,
+            'occupied':       occupied,
+            'available':      available,
+            'isFull':         new_status == 'full',
+            'status':         new_status,
         }), 200
     return jsonify({'error': result.get('error', 'Failed to update capacity')}), 400
 
@@ -654,4 +702,217 @@ def remove_company_assignment():
         'studentId': student_id,
         'studentName': student.get('name'),
         'previousCompany': company.get('name'),
+    }), 200
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RETROACTIVE ACCOUNT LINKING  POST /api/companies/link-accounts
+# Scans every company and HTE profile whose supervisor/adviser is stored as
+# plain text, looks up the matching user account by name, and saves the real
+# user ID back.  Safe to call multiple times (idempotent).
+# ─────────────────────────────────────────────────────────────────────────────
+@company_bp.route('/link-accounts', methods=['POST'])
+@jwt_required()
+def link_accounts():
+    """
+    POST /api/companies/link-accounts
+    Retroactively resolve supervisor/adviser names in all existing companies
+    and HTE profiles to real user account IDs.
+
+    Returns a summary of what was linked, what was already linked, and what
+    could not be matched.
+    """
+    from flask_jwt_extended import get_jwt_identity
+    svc = _get_service()
+    current_user_id = get_jwt_identity()
+
+    caller = svc.get_user(current_user_id)
+    if not caller:
+        return jsonify({'error': 'Caller not found'}), 403
+    role = (caller.get('role') or '').lower().strip()
+    role = {'admin': 'coordinator', 'employee': 'adviser'}.get(role, role)
+    if role not in ('coordinator', 'chairman'):
+        return jsonify({'error': 'Only coordinators or chairpersons can run account linking'}), 403
+
+    # ── Build name lookup maps from all users ─────────────────────────────────
+    all_users = svc.get_all_users()
+    supervisor_by_name = {}
+    adviser_by_name = {}
+    for u in all_users:
+        u_role = (u.get('role') or '').lower().strip()
+        u_name_key = (u.get('name') or '').strip().lower()
+        if not u_name_key:
+            continue
+        if u_role == 'supervisor':
+            supervisor_by_name[u_name_key] = u
+        elif u_role == 'adviser':
+            adviser_by_name[u_name_key] = u
+
+    def _find_user(name: str, role_map: dict):
+        """Exact then partial name match. Returns user dict or None."""
+        if not name:
+            return None
+        key = name.strip().lower()
+        if key in role_map:
+            return role_map[key]
+        for stored_key, u in role_map.items():
+            if key in stored_key or stored_key in key:
+                return u
+        return None
+
+    linked = []
+    already_linked = []
+    unmatched = []
+
+    # ── Process companies collection ──────────────────────────────────────────
+    try:
+        companies = svc.get_companies() or []
+    except Exception as e:
+        return jsonify({'error': f'Failed to load companies: {e}'}), 500
+
+    for company in companies:
+        cid = company.get('id', '')
+        if not cid:
+            continue
+        cname = company.get('name', '')
+        updates = {}
+
+        # Supervisor
+        sup_name = (company.get('supervisor') or company.get('contactPerson') or '').strip()
+        sup_id   = (company.get('supervisorId') or '').strip()
+        if sup_name and not sup_id:
+            sup_user = _find_user(sup_name, supervisor_by_name)
+            if sup_user:
+                updates['supervisorId'] = sup_user['id']
+                updates['supervisor']   = sup_user.get('name', sup_name)
+                # Update the supervisor's user record to know their company
+                try:
+                    svc.update_user(sup_user['id'], {
+                        'companyId':   cid,
+                        'companyName': cname,
+                        'company':     cname,
+                    })
+                except Exception as ue:
+                    print(f"[link-accounts] Could not update supervisor user {sup_user['id']}: {ue}")
+                linked.append({
+                    'entity': 'company',
+                    'company': cname,
+                    'role': 'supervisor',
+                    'name': sup_user.get('name', sup_name),
+                    'id': sup_user['id'],
+                })
+            else:
+                unmatched.append({'entity': 'company', 'company': cname, 'role': 'supervisor', 'name': sup_name})
+        elif sup_id:
+            already_linked.append({'entity': 'company', 'company': cname, 'role': 'supervisor', 'id': sup_id})
+
+        # Adviser
+        adv_name = (company.get('adviser') or company.get('adviserName') or '').strip()
+        adv_id   = (company.get('adviserId') or '').strip()
+        if adv_name and not adv_id:
+            adv_user = _find_user(adv_name, adviser_by_name)
+            if adv_user:
+                updates['adviserId']   = adv_user['id']
+                updates['adviser']     = adv_user.get('name', adv_name)
+                updates['adviserName'] = adv_user.get('name', adv_name)
+                linked.append({
+                    'entity': 'company',
+                    'company': cname,
+                    'role': 'adviser',
+                    'name': adv_user.get('name', adv_name),
+                    'id': adv_user['id'],
+                })
+            else:
+                unmatched.append({'entity': 'company', 'company': cname, 'role': 'adviser', 'name': adv_name})
+        elif adv_id:
+            already_linked.append({'entity': 'company', 'company': cname, 'role': 'adviser', 'id': adv_id})
+
+        if updates:
+            try:
+                svc.update_company(cid, updates)
+                print(f"[link-accounts] Updated company '{cname}': {list(updates.keys())}")
+            except Exception as ue:
+                print(f"[link-accounts] Failed to update company '{cname}': {ue}")
+
+    # ── Process hte_profiles collection ──────────────────────────────────────
+    try:
+        hte_profiles = svc.get_hte_profiles() or []
+    except Exception as e:
+        hte_profiles = []
+        print(f"[link-accounts] Could not load hte_profiles: {e}")
+
+    for hte in hte_profiles:
+        hid = hte.get('id', '')
+        if not hid:
+            continue
+        hname = hte.get('name', '')
+        updates = {}
+
+        # Supervisor
+        sup_name = (hte.get('supervisor') or hte.get('contactPerson') or '').strip()
+        sup_id   = (hte.get('supervisorId') or '').strip()
+        if sup_name and not sup_id:
+            sup_user = _find_user(sup_name, supervisor_by_name)
+            if sup_user:
+                updates['supervisorId'] = sup_user['id']
+                updates['supervisor']   = sup_user.get('name', sup_name)
+                try:
+                    svc.update_user(sup_user['id'], {
+                        'companyId':   hid,
+                        'companyName': hname,
+                        'company':     hname,
+                    })
+                except Exception as ue:
+                    print(f"[link-accounts] Could not update supervisor user {sup_user['id']}: {ue}")
+                linked.append({
+                    'entity': 'hte_profile',
+                    'company': hname,
+                    'role': 'supervisor',
+                    'name': sup_user.get('name', sup_name),
+                    'id': sup_user['id'],
+                })
+            else:
+                unmatched.append({'entity': 'hte_profile', 'company': hname, 'role': 'supervisor', 'name': sup_name})
+        elif sup_id:
+            already_linked.append({'entity': 'hte_profile', 'company': hname, 'role': 'supervisor', 'id': sup_id})
+
+        # Adviser
+        adv_name = (hte.get('adviser') or hte.get('adviserName') or '').strip()
+        adv_id   = (hte.get('adviserId') or '').strip()
+        if adv_name and not adv_id:
+            adv_user = _find_user(adv_name, adviser_by_name)
+            if adv_user:
+                updates['adviserId']   = adv_user['id']
+                updates['adviser']     = adv_user.get('name', adv_name)
+                updates['adviserName'] = adv_user.get('name', adv_name)
+                linked.append({
+                    'entity': 'hte_profile',
+                    'company': hname,
+                    'role': 'adviser',
+                    'name': adv_user.get('name', adv_name),
+                    'id': adv_user['id'],
+                })
+            else:
+                unmatched.append({'entity': 'hte_profile', 'company': hname, 'role': 'adviser', 'name': adv_name})
+        elif adv_id:
+            already_linked.append({'entity': 'hte_profile', 'company': hname, 'role': 'adviser', 'id': adv_id})
+
+        if updates:
+            try:
+                svc.update_hte_profile(hid, updates)
+                print(f"[link-accounts] Updated HTE profile '{hname}': {list(updates.keys())}")
+            except Exception as ue:
+                print(f"[link-accounts] Failed to update HTE profile '{hname}': {ue}")
+
+    print(f"[link-accounts] Done. linked={len(linked)}, already_linked={len(already_linked)}, unmatched={len(unmatched)}")
+    return jsonify({
+        'success': True,
+        'linked': linked,
+        'alreadyLinked': already_linked,
+        'unmatched': unmatched,
+        'summary': (
+            f"Linked {len(linked)} account(s). "
+            f"{len(already_linked)} already had IDs. "
+            f"{len(unmatched)} name(s) could not be matched."
+        ),
     }), 200

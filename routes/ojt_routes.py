@@ -7,6 +7,7 @@ from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from datetime import datetime, timezone, timedelta
 from services.firebase_service import FirebaseService
+import re
 
 ojt_bp = Blueprint('ojt', __name__)
 
@@ -15,8 +16,6 @@ _firebase_service = None
 ROLE_ALIASES = {'admin': 'coordinator', 'employee': 'adviser'}
 # Roles allowed to update OJT settings — coordinators and chairmen only
 OJT_SETTINGS_ROLES = {'coordinator', 'chairman'}
-# Fields a supervisor is allowed to update
-SUPERVISOR_EDITABLE_FIELDS = {'ojtStartTime', 'ojtEndTime', 'lateThreshold'}
 
 
 def set_firebase_service(service: FirebaseService):
@@ -202,8 +201,8 @@ def get_ojt_settings():
 def update_ojt_settings():
     """Update OJT settings.
 
-    Coordinators/chairmen can update any field.
-    Supervisors can only update ojtStartTime, ojtEndTime, and lateThreshold.
+    Only coordinators and chairmen can update OJT timing/schedule settings.
+    Supervisors are NOT allowed — they cannot set start time, end time, or late threshold.
     """
     svc = _get_service()
     current_user_id = get_jwt_identity()
@@ -215,19 +214,197 @@ def update_ojt_settings():
 
     user_role = _effective_role(user.get('role', ''))
 
+    # Supervisors cannot modify OJT schedule — coordinator-only
     if user_role == 'supervisor':
-        # Only allow editing the three schedule fields
-        allowed = {k: v for k, v in data.items() if k in SUPERVISOR_EDITABLE_FIELDS}
-        if not allowed:
-            return jsonify({'error': 'Supervisors may only update ojtStartTime, ojtEndTime, and lateThreshold'}), 403
-        data = allowed
+        return jsonify({'error': 'OJT schedule settings can only be changed by the Coordinator. Please contact your coordinator.'}), 403
     elif user_role not in OJT_SETTINGS_ROLES:
-        return jsonify({'error': 'Only coordinators, chairmen, or supervisors can update OJT settings'}), 403
+        return jsonify({'error': 'Only coordinators or chairmen can update OJT settings'}), 403
 
     result = svc.update_settings(data)
     if result['success']:
         return jsonify({'success': True, 'settings': result['settings']}), 200
     return jsonify({'error': result['error']}), 400
+
+
+def _build_two_session_schedule(sched, settings):
+    """Build the full two-session schedule response dict from a raw sched doc + global settings fallback."""
+    morning_checkin  = sched.get('morningCheckinTime')  or settings.get('ojtMorningCheckinTime',  '08:00')
+    morning_checkout = sched.get('morningCheckoutTime') or settings.get('ojtMorningCheckoutTime', '12:00')
+    afternoon_checkin  = sched.get('afternoonCheckinTime')  or settings.get('ojtAfternoonCheckinTime',  '13:00')
+    afternoon_checkout = sched.get('afternoonCheckoutTime') or settings.get('ojtAfternoonCheckoutTime', '17:00')
+    late_threshold_min = sched.get('lateThresholdMinutes')
+    if late_threshold_min is None:
+        late_threshold_min = settings.get('lateThreshold', 15)
+    return {
+        'morningCheckinTime':    morning_checkin,
+        'morningCheckoutTime':   morning_checkout,
+        'afternoonCheckinTime':  afternoon_checkin,
+        'afternoonCheckoutTime': afternoon_checkout,
+        'lateThresholdMinutes':  int(late_threshold_min),
+        # Backward-compat
+        'startTime':    morning_checkin,
+        'endTime':      afternoon_checkout,
+        'lateThreshold': int(late_threshold_min),
+    }
+
+
+@ojt_bp.route('/supervisor-schedule', methods=['PUT'])
+@jwt_required()
+def update_supervisor_schedule():
+    """Set the OJT schedule for the authenticated supervisor's assigned students.
+
+    Only supervisors may call this. Each assigned student's user record is
+    updated with the two-session schedule fields so attendance uses the
+    per-student override; global OJT settings are left untouched.
+    """
+    svc = _get_service()
+    caller_id = get_jwt_identity()
+
+    user = svc.get_user(caller_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    if _effective_role(user.get('role', '')) != 'supervisor':
+        return jsonify({'error': 'Only supervisors can set a supervisor OJT schedule'}), 403
+
+    data = request.get_json() or {}
+
+    # New two-session fields (with defaults)
+    morning_checkin    = (data.get('morningCheckinTime')    or data.get('startTime')  or '08:00').strip()
+    morning_checkout   = (data.get('morningCheckoutTime')   or '12:00').strip()
+    afternoon_checkin  = (data.get('afternoonCheckinTime')  or '13:00').strip()
+    afternoon_checkout = (data.get('afternoonCheckoutTime') or data.get('endTime')   or '17:00').strip()
+    late_threshold_min = data.get('lateThresholdMinutes', data.get('lateThreshold', 15))
+
+    time_fields = [morning_checkin, morning_checkout, afternoon_checkin, afternoon_checkout]
+    for tf in time_fields:
+        if not re.match(r'^\d{2}:\d{2}$', tf):
+            return jsonify({'error': 'All time fields must be in HH:MM format'}), 400
+    try:
+        late_threshold_min = int(late_threshold_min)
+    except (ValueError, TypeError):
+        return jsonify({'error': 'lateThresholdMinutes must be a non-negative integer'}), 400
+    if late_threshold_min < 0:
+        return jsonify({'error': 'lateThresholdMinutes must be a non-negative integer'}), 400
+
+    save_doc = {
+        'morningCheckinTime':    morning_checkin,
+        'morningCheckoutTime':   morning_checkout,
+        'afternoonCheckinTime':  afternoon_checkin,
+        'afternoonCheckoutTime': afternoon_checkout,
+        'lateThresholdMinutes':  late_threshold_min,
+        # Backward-compat legacy fields
+        'startTime':    morning_checkin,
+        'endTime':      afternoon_checkout,
+        'lateThreshold': late_threshold_min,
+    }
+
+    result = svc.save_supervisor_schedule(caller_id, save_doc)
+    if not result.get('success'):
+        return jsonify({'error': result.get('error', 'Failed to save schedule')}), 500
+
+    # Propagate the schedule to each assigned student's user record
+    for student in svc.get_students_by_supervisor(caller_id):
+        svc.update_user(student['id'], {
+            # New two-session fields
+            'ojtMorningCheckinTime':    morning_checkin,
+            'ojtMorningCheckoutTime':   morning_checkout,
+            'ojtAfternoonCheckinTime':  afternoon_checkin,
+            'ojtAfternoonCheckoutTime': afternoon_checkout,
+            'ojtLateThresholdMinutes':  late_threshold_min,
+            # Backward-compat legacy fields
+            'ojtStartTime':     morning_checkin,
+            'ojtEndTime':       afternoon_checkout,
+            'ojtLateThreshold': late_threshold_min,
+        })
+
+    settings = svc.get_settings()
+    return jsonify(_build_two_session_schedule(save_doc, settings)), 200
+
+
+@ojt_bp.route('/supervisor-schedule', methods=['GET'])
+@jwt_required()
+def get_supervisor_schedule_route():
+    """Get the authenticated supervisor's OJT schedule, falling back to global settings."""
+    svc = _get_service()
+    caller_id = get_jwt_identity()
+
+    user = svc.get_user(caller_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    if _effective_role(user.get('role', '')) != 'supervisor':
+        return jsonify({'error': 'Only supervisors can view a supervisor OJT schedule'}), 403
+
+    sched = svc.get_supervisor_schedule(caller_id)
+    settings = svc.get_settings()
+    return jsonify(_build_two_session_schedule(sched, settings)), 200
+
+
+@ojt_bp.route('/schedule/<supervisor_id>', methods=['GET'])
+@jwt_required()
+def get_schedule_by_supervisor(supervisor_id):
+    """Get the saved schedule for a given supervisor (public to authenticated users).
+
+    Used by Flutter to fetch the schedule via the student's assigned supervisorId.
+    Returns defaults if no schedule has been saved yet.
+    """
+    svc = _get_service()
+    sched = svc.get_supervisor_schedule(supervisor_id)
+    settings = svc.get_settings()
+    return jsonify(_build_two_session_schedule(sched, settings)), 200
+
+
+@ojt_bp.route('/student-schedule/<student_id>', methods=['GET'])
+@jwt_required()
+def get_student_schedule(student_id):
+    """Get the effective OJT schedule for a student (per-student override or global).
+
+    Allowed for: the student themselves, their supervisor, their adviser,
+    coordinators, and chairmen.
+    """
+    svc = _get_service()
+    caller_id = get_jwt_identity()
+
+    caller = svc.get_user(caller_id)
+    if not caller:
+        return jsonify({'error': 'User not found'}), 404
+
+    student = svc.get_user(student_id)
+    if not student:
+        return jsonify({'error': 'Student not found'}), 404
+
+    role = _effective_role(caller.get('role', ''))
+    allowed = (
+        caller_id == student_id
+        or role in {'coordinator', 'chairman'}
+        or (role == 'adviser' and student.get('adviserId') == caller_id)
+        or (role == 'supervisor' and student.get('supervisorId') == caller_id)
+    )
+    if not allowed:
+        return jsonify({'error': 'Not authorized to view this student schedule'}), 403
+
+    settings = svc.get_settings()
+
+    # Build schedule from per-student fields first, then supervisor schedule, then global defaults
+    sched = {
+        'morningCheckinTime':    student.get('ojtMorningCheckinTime')    or student.get('ojtStartTime'),
+        'morningCheckoutTime':   student.get('ojtMorningCheckoutTime'),
+        'afternoonCheckinTime':  student.get('ojtAfternoonCheckinTime'),
+        'afternoonCheckoutTime': student.get('ojtAfternoonCheckoutTime') or student.get('ojtEndTime'),
+        'lateThresholdMinutes':  student.get('ojtLateThresholdMinutes')  or student.get('ojtLateThreshold'),
+    }
+
+    # If per-student fields are missing, use the supervisor's saved schedule
+    has_any = any(v for v in sched.values() if v)
+    if not has_any:
+        supervisor_id = student.get('supervisorId') or student.get('supervisor_id')
+        if supervisor_id:
+            sup_sched = svc.get_supervisor_schedule(supervisor_id)
+            if sup_sched:
+                sched = sup_sched
+
+    return jsonify(_build_two_session_schedule(sched, settings)), 200
 
 
 @ojt_bp.route('/total-hours', methods=['PUT'])

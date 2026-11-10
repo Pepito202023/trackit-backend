@@ -65,8 +65,14 @@ def list_tasks():
 
     if role == 'coordinator' or role == 'admin':
         tasks = _get_service().get_all_tasks()
+    elif role == 'supervisor':
+        # Supervisors see only tasks assigned to their own students
+        my_students = _get_service().get_students_by_supervisor(current_user_id)
+        my_student_ids = {s['id'] for s in my_students if s.get('id')}
+        all_my_tasks = _get_service().get_tasks_created_by(current_user_id)
+        tasks = [t for t in all_my_tasks if t.get('assigneeId') in my_student_ids]
     elif role in ADMIN_ROLES:
-        # Supervisor/adviser: see only tasks they created
+        # Adviser: see only tasks they created
         tasks = _get_service().get_tasks_created_by(current_user_id)
     else:
         tasks = _get_service().get_tasks_for_user(current_user_id)
@@ -258,19 +264,28 @@ def upload_task_proof(task_id):
     unique_filename = f"{task_id}_{current_user_id}_{uuid.uuid4().hex}.{file_ext}"
     file_path = os.path.join(UPLOAD_FOLDER, unique_filename)
 
-    # Save file
+    # Save file locally as fallback, but also try Firebase Storage
     try:
         file.save(file_path)
-        print(f"[Task Routes] Proof photo saved: {unique_filename}")
+        print(f"[Task Routes] Proof photo saved locally: {unique_filename}")
     except Exception as e:
-        print(f"[Task Routes] Error saving file: {e}")
-        return jsonify({'error': 'Failed to save photo'}), 500
+        print(f"[Task Routes] Error saving file locally: {e}")
 
-    # Generate public URL
-    # Note: In production, this should be a proper CDN or storage URL
-    # For now, we'll use the backend's public URL
-    from flask import url_for
+    # Try uploading to Firebase Storage for persistence across server restarts
     photo_url = f"/uploads/task_proofs/{unique_filename}"
+    try:
+        file.seek(0)
+        image_bytes = file.read()
+        if image_bytes:
+            import sys, os as _os
+            sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), '..'))
+            from routes.attendance_routes import _save_face_photo_bytes
+            storage_url = _save_face_photo_bytes(image_bytes, f"{task_id}_{current_user_id}", 'task_proof', unique_filename)
+            if storage_url:
+                photo_url = storage_url
+                print(f"[Task Routes] Proof uploaded to storage: {storage_url[:80]}")
+    except Exception as _e:
+        print(f"[Task Routes] Storage upload failed, using local path: {_e}")
 
     # Update task with proof photo URL and mark as completed
     update_data = {

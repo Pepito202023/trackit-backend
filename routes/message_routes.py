@@ -47,6 +47,200 @@ def _effective_role(role: str) -> str:
     return ROLE_ALIASES.get(r, r)
 
 
+def _is_chairperson(role: str) -> bool:
+    """Chairperson role may be stored as 'chairman' or 'chairperson'."""
+    return _effective_role(role) in ('chairman', 'chairperson')
+
+
+def _public_photo_url(value):
+    """Mirror user_routes._public_photo_url so local /uploads/ paths resolve."""
+    if not value or not isinstance(value, str):
+        return value
+    s = value.strip()
+    if s.startswith('/uploads/'):
+        return request.host_url.rstrip('/') + s
+    return s
+
+
+def _contact_from_user(user) -> dict:
+    """Reduce a user record to the safe contact fields (passwords never sent)."""
+    if not isinstance(user, dict):
+        return {}
+    pic = user.get('profilePicture') or user.get('avatar') or ''
+    return {
+        'id': user.get('id'),
+        'name': (user.get('name') or '').strip(),
+        'role': _effective_role(user.get('role', '')),
+        'email': user.get('email') or '',
+        'profilePicture': _public_photo_url(pic),
+        'department': user.get('department') or '',
+    }
+
+
+@message_bp.route('/contacts', methods=['GET'])
+@jwt_required()
+def get_message_contacts():
+    """Return the messageable contacts visible to the current user.
+
+    Filtering rules (driven by the authenticated user's role):
+      - coordinator / chairperson : everyone (unchanged behaviour)
+      - supervisor   : their assigned students + those students' advisers
+                       + all coordinators + all chairpersons
+      - adviser      : their assigned students + those students' supervisors
+                       + all coordinators + all chairpersons
+      - student      : their own supervisor + their own adviser
+                       + all coordinators + all chairpersons
+
+    Results are deduplicated by id, passwords are never returned, and the
+    caller is never included in their own contact list.
+    """
+    svc = _get_service()
+    current_user_id = get_jwt_identity()
+    caller = svc.get_user(current_user_id)
+    if not caller:
+        return jsonify({'error': 'User not found'}), 404
+
+    role = _effective_role(caller.get('role', ''))
+
+    contacts = {}  # id -> contact dict (dedupe by id)
+
+    def add(user):
+        if not isinstance(user, dict):
+            return
+        uid = user.get('id')
+        if not uid or uid == current_user_id:
+            return
+        c = _contact_from_user(user)
+        if c.get('id'):
+            contacts[uid] = c
+
+    # Coordinators and chairpersons see everyone (unchanged behaviour)
+    if role == 'coordinator' or _is_chairperson(role):
+        for u in svc.get_all_users():
+            add(u)
+        return jsonify(list(contacts.values())), 200
+
+    # Staff and students always see all coordinators + all chairpersons
+    all_users = svc.get_all_users()
+    by_id = {u.get('id'): u for u in all_users if u.get('id')}
+    for u in all_users:
+        r = _effective_role(u.get('role', ''))
+        if r == 'coordinator' or _is_chairperson(r):
+            add(u)
+
+    def lookup(uid):
+        uid = (uid or '').strip()
+        if not uid:
+            return None
+        return by_id.get(uid) or svc.get_user(uid)
+
+    if role == 'supervisor':
+        # Assigned students + their advisers
+        adviser_ids = set()
+        for s in svc.get_students_by_supervisor(current_user_id):
+            add(s)
+            aid = (s.get('adviserId') or '').strip()
+            if aid:
+                adviser_ids.add(aid)
+        # Fallback: find students via company if none found by supervisorId
+        if not any(c for c in contacts.values() if _effective_role(c.get('role','')) == 'student'):
+            try:
+                sup_name = (caller.get('name') or '').strip().lower()
+                for c in (svc.get_companies() or []):
+                    c_sup = (c.get('supervisor') or c.get('supervisorName') or '').strip().lower()
+                    if c_sup == sup_name:
+                        cname = (c.get('name') or '').strip().lower()
+                        cid = c.get('id', '')
+                        for u in all_users:
+                            if _effective_role(u.get('role','')) == 'student':
+                                if (u.get('companyId') == cid or
+                                        (u.get('company') or u.get('companyName') or '').strip().lower() == cname):
+                                    add(u)
+                                    aid = (u.get('adviserId') or '').strip()
+                                    if aid:
+                                        adviser_ids.add(aid)
+                        # Also get adviser from company record
+                        if c.get('adviserId'):
+                            adviser_ids.add(c['adviserId'])
+                        break
+            except Exception:
+                pass
+        for aid in adviser_ids:
+            add(lookup(aid))
+
+    elif role == 'adviser':
+        # Assigned students + their supervisors
+        supervisor_ids = set()
+        for s in svc.get_students_by_adviser(current_user_id):
+            add(s)
+            sid = (s.get('supervisorId') or '').strip()
+            if sid:
+                supervisor_ids.add(sid)
+        # Fallback: find students via company if none found by adviserId
+        if not any(c for c in contacts.values() if _effective_role(c.get('role','')) == 'student'):
+            try:
+                adv_name = (caller.get('name') or '').strip().lower()
+                for c in (svc.get_companies() or []):
+                    c_adv = (c.get('adviser') or c.get('adviserName') or '').strip().lower()
+                    if c_adv == adv_name:
+                        cname = (c.get('name') or '').strip().lower()
+                        cid = c.get('id', '')
+                        for u in all_users:
+                            if _effective_role(u.get('role','')) == 'student':
+                                if (u.get('companyId') == cid or
+                                        (u.get('company') or u.get('companyName') or '').strip().lower() == cname):
+                                    add(u)
+                                    sid = (u.get('supervisorId') or '').strip()
+                                    if sid:
+                                        supervisor_ids.add(sid)
+                        # Also get supervisor from company record
+                        if c.get('supervisorId'):
+                            supervisor_ids.add(c['supervisorId'])
+                        break
+            except Exception:
+                pass
+        for sid in supervisor_ids:
+            add(lookup(sid))
+    elif role == 'student':
+        # Their own supervisor + their own adviser
+        add(lookup(caller.get('supervisorId')))
+        add(lookup(caller.get('adviserId')))
+        # Fallback: find via company record if IDs not set
+        if not any(c for c in contacts.values() if _effective_role(c.get('role','')) in ('supervisor','adviser')):
+            try:
+                cid = caller.get('companyId', '')
+                cname = (caller.get('company') or caller.get('companyName') or '').strip().lower()
+                if cid or cname:
+                    for c in (svc.get_companies() or []):
+                        if (cid and c.get('id') == cid) or \
+                           (cname and (c.get('name') or '').strip().lower() == cname):
+                            if c.get('supervisorId'):
+                                add(lookup(c['supervisorId']))
+                            elif c.get('supervisor'):
+                                sup_name = c['supervisor'].strip().lower()
+                                for u in all_users:
+                                    if _effective_role(u.get('role','')) == 'supervisor' and \
+                                       (u.get('name') or '').strip().lower() == sup_name:
+                                        add(u)
+                                        break
+                            if c.get('adviserId'):
+                                add(lookup(c['adviserId']))
+                            elif c.get('adviser'):
+                                adv_name = (c.get('adviser') or '').strip().lower()
+                                for u in all_users:
+                                    if _effective_role(u.get('role','')) == 'adviser' and \
+                                       (u.get('name') or '').strip().lower() == adv_name:
+                                        add(u)
+                                        break
+                            break
+            except Exception:
+                pass
+    # Unknown roles only see coordinators + chairpersons (already added)
+
+    result = sorted(contacts.values(), key=lambda c: (c.get('name') or '').lower())
+    return jsonify(result), 200
+
+
 @message_bp.route('/conversations', methods=['GET'])
 @jwt_required()
 def get_conversations():

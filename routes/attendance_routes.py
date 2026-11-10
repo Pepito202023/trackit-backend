@@ -266,39 +266,63 @@ def get_all_attendance_records():
             record['studentName'] = student.get('name', 'Unknown')
             record['idNumber'] = student.get('idNumber', '')
             record['department'] = student.get('department', '')
+            # Include the student's assigned company so the frontend can filter by HTE
+            record['company'] = (student.get('company') or student.get('companyName') or '').strip()
         enriched_records.append(_absolutize_attendance_record(record))
 
-    # ── Recalculate late/present status using CURRENT OJT settings ────────────
+    # ── Recalculate late/present/incomplete status using CURRENT OJT settings ─
     # This corrects any records whose status was set when a supervisor had
     # incorrectly changed the OJT start time. A per-student supervisor schedule
     # overrides the global OJT settings.
     try:
         settings = svc.get_settings()
-        global_start = settings.get('ojtStartTime', '08:00')
+        global_morning_ci   = settings.get('ojtMorningCheckinTime', settings.get('ojtStartTime', '08:00'))
+        global_afternoon_ci = settings.get('ojtAfternoonCheckinTime', '13:00')
+        global_morning_co   = settings.get('ojtMorningCheckoutTime', '12:00')
         global_threshold = int(settings.get('lateThreshold', 15))
         for rec in enriched_records:
             check_in = rec.get('checkIn')
             if not check_in:
-                rec['status'] = 'absent'
+                if rec.get('status') != 'absent':
+                    rec['status'] = 'absent'
                 continue
-            # Only recalculate present/late — do not touch 'absent'
+            # Only recalculate present/late/incomplete — do not touch 'absent'
             if rec.get('status') == 'absent':
                 continue
             try:
-                # Resolve per-student override, else fall back to global
+                # Check for incomplete (has open session)
+                time_logs = rec.get('timeLogs') or []
+                has_open = any(e.get('checkIn') and not e.get('checkOut') for e in time_logs)
+                has_checkout = bool(rec.get('checkOut'))
+                if has_open and not has_checkout:
+                    rec['status'] = 'incomplete'
+                    continue
+                # Resolve per-student override
                 stu = svc.get_user(rec.get('userId'))
-                start_time_str = (stu.get('ojtStartTime') if stu else None) or global_start
-                stu_threshold = stu.get('ojtLateThreshold') if stu else None
-                late_threshold = int(
-                    stu_threshold if stu_threshold is not None else global_threshold
-                )
-                start_h, start_m = map(int, start_time_str.split(':'))
+                morning_ci_str = (stu.get('ojtMorningCheckinTime') if stu else None) or global_morning_ci
+                morning_co_str = (stu.get('ojtMorningCheckoutTime') if stu else None) or global_morning_co
+                afternoon_ci_str = (stu.get('ojtAfternoonCheckinTime') if stu else None) or global_afternoon_ci
+                stu_threshold = stu.get('ojtLateThresholdMinutes') if stu else None
+                if stu_threshold is None:
+                    stu_threshold = stu.get('ojtLateThreshold') if stu else None
+                late_threshold = int(stu_threshold if stu_threshold is not None else global_threshold)
                 from datetime import datetime as _dt
-                # Parse HH:MM or HH:MM:SS
                 time_part = str(check_in).strip()[:5]  # "HH:MM"
                 ci_h, ci_m = map(int, time_part.split(':'))
-                cutoff_total = start_h * 60 + start_m + late_threshold
                 checkin_total = ci_h * 60 + ci_m
+                # Determine which session this check-in belongs to
+                def _tmin(hhmm):
+                    h2, m2 = map(int, hhmm.split(':'))
+                    return h2 * 60 + m2
+                mci_min = _tmin(morning_ci_str)
+                mco_min = _tmin(morning_co_str)
+                aci_min = _tmin(afternoon_ci_str)
+                # Pick the correct session start for the late-threshold calculation
+                if checkin_total < mco_min:
+                    session_start_min = mci_min
+                else:
+                    session_start_min = aci_min
+                cutoff_total = session_start_min + late_threshold
                 rec['status'] = 'late' if checkin_total > cutoff_total else 'present'
             except Exception:
                 pass  # leave status unchanged if time parse fails
@@ -359,7 +383,7 @@ def record_checkin():
                 )
                 print(f"[CHECK-IN RE-VERIFY] user={current_user_id} "
                       f"photo={photo_score:.3f} gray={gray_score:.3f}")
-                if photo_score < 0.30 and gray_score < 0.20:
+                if photo_score < 0.30 or gray_score < 0.20:
                     face_verified = False
                     return jsonify({
                         'error': 'Face verification failed. The submitted photo does not match your registered face.'
@@ -382,31 +406,61 @@ def record_checkin():
     # Use Philippine Time (UTC+8) for the date field so records are stored
     # under the local calendar date, not the UTC date.
     PH_TZ_OFFSET = timedelta(hours=8)
-    today = (datetime.now(timezone.utc) + PH_TZ_OFFSET).strftime('%Y-%m-%d')
+    now_ph = datetime.now(timezone.utc) + PH_TZ_OFFSET
+    today = now_ph.strftime('%Y-%m-%d')
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    # ── Determine late status from OJT settings ───────────────────────────────
+    # ── Load two-session schedule ─────────────────────────────────────────────
     try:
-        settings       = svc.get_settings()
-        start_time_str = settings.get('ojtStartTime', '08:00')   # e.g. "08:00"
-        late_threshold = int(settings.get('lateThreshold', 15))  # minutes
-        # Per-student supervisor schedule overrides the global OJT settings
+        settings = svc.get_settings()
         student = svc.get_user(current_user_id)
-        if student:
-            if student.get('ojtStartTime'):
-                start_time_str = student['ojtStartTime']
-            if student.get('ojtLateThreshold') is not None:
-                try:
-                    late_threshold = int(student['ojtLateThreshold'])
-                except Exception:
-                    pass
-        # Parse start time in the server's local timezone
-        start_h, start_m = map(int, start_time_str.split(':'))
-        now_local = datetime.now()
-        cutoff = now_local.replace(hour=start_h, minute=start_m + late_threshold,
-                                   second=0, microsecond=0)
-        attendance_status = 'late' if now_local > cutoff else 'present'
-    except Exception:
+        def _t(hhmm):
+            h, m = map(int, hhmm.split(':'))
+            return h * 60 + m
+
+        morning_checkin_str  = (student.get('ojtMorningCheckinTime')    if student else None) or settings.get('ojtMorningCheckinTime',  '08:00')
+        morning_checkout_str = (student.get('ojtMorningCheckoutTime')   if student else None) or settings.get('ojtMorningCheckoutTime', '12:00')
+        afternoon_checkin_str  = (student.get('ojtAfternoonCheckinTime')  if student else None) or settings.get('ojtAfternoonCheckinTime',  '13:00')
+        afternoon_checkout_str = (student.get('ojtAfternoonCheckoutTime') if student else None) or settings.get('ojtAfternoonCheckoutTime', '17:00')
+        late_thresh_min = (student.get('ojtLateThresholdMinutes') if student else None)
+        if late_thresh_min is None:
+            late_thresh_min = (student.get('ojtLateThreshold') if student else None)
+        if late_thresh_min is None:
+            late_thresh_min = settings.get('lateThreshold', 15)
+        late_thresh_min = int(late_thresh_min)
+
+        now_total = now_ph.hour * 60 + now_ph.minute
+        t_morning_ci  = _t(morning_checkin_str)
+        t_morning_co  = _t(morning_checkout_str)
+        t_afternoon_ci  = _t(afternoon_checkin_str)
+        t_afternoon_co  = _t(afternoon_checkout_str)
+        t_evening_cutoff = 18 * 60  # 18:00
+
+        # Determine session
+        if t_morning_co <= now_total < t_afternoon_ci:
+            # Lunch break
+            return jsonify({'error': 'Attendance not allowed during lunch break (12:00–1:00 PM)'}), 400
+        elif t_morning_ci <= now_total < t_morning_co:
+            session = 'morning'
+            session_checkin_str = morning_checkin_str
+        elif t_afternoon_ci <= now_total <= t_evening_cutoff:
+            session = 'afternoon'
+            session_checkin_str = afternoon_checkin_str
+        else:
+            # Outside OJT hours
+            return jsonify({'error': 'No active OJT session right now'}), 400
+
+        # Determine late status
+        if session in ('morning', 'afternoon'):
+            cutoff_total = _t(session_checkin_str) + late_thresh_min
+            attendance_status = 'late' if now_total > cutoff_total else 'present'
+        else:
+            attendance_status = 'present'  # should not reach here after outside-session block above
+
+        print(f"[CHECK-IN] session={session} now={now_ph.strftime('%H:%M')} status={attendance_status}")
+    except Exception as e:
+        print(f"[CHECK-IN] schedule detection failed: {e}")
+        session = 'morning'
         attendance_status = 'present'
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -416,8 +470,25 @@ def record_checkin():
         print(f"[ERROR] get_today_attendance failed: {e}")
         return jsonify({'error': f'Database error: {str(e)}'}), 500
 
+    # ── Duplicate check for this session ─────────────────────────────────────
+    if existing and session in ('morning', 'afternoon'):
+        time_logs_existing = existing.get('timeLogs') or []
+        already_checked_in = any(
+            e.get('session') == session and e.get('checkIn')
+            for e in time_logs_existing
+        )
+        if already_checked_in:
+            return jsonify({'error': f'Already checked in for the {session} session.'}), 400
+    # ─────────────────────────────────────────────────────────────────────────
+
+    supervisor_id_val = (student.get('supervisorId') if student else None) or ''
+
     new_log_entry = {
         'checkIn':  now_iso,
+        'session':  session,
+        'status':   attendance_status,
+        'date':     today,
+        'student_id': current_user_id,
         'checkInLocation': {
             'latitude':  latitude,
             'longitude': longitude,
@@ -428,6 +499,8 @@ def record_checkin():
         'livenessVerified':    liveness_verified,
         'locationDisabled':    location_disabled,
     }
+    if supervisor_id_val:
+        new_log_entry['supervisor_id'] = supervisor_id_val
     if face_photo_url:
         new_log_entry['checkInFacePhotoUrl'] = face_photo_url
         print(f"[CHECK-IN] Added checkInFacePhotoUrl to log entry: {face_photo_url}")
@@ -449,6 +522,10 @@ def record_checkin():
             'updatedAt': now_iso,
             'status':    attendance_status,
         }
+        if session == 'morning':
+            update_data['morningSession'] = 'checked_in'
+        elif session == 'afternoon':
+            update_data['afternoonSession'] = 'checked_in'
         if face_photo_url:
             update_data['checkInFacePhotoUrl'] = face_photo_url
         if getattr(svc, 'db', None):
@@ -464,8 +541,8 @@ def record_checkin():
             return jsonify({'error': f'Failed to update record: {str(e)}'}), 500
 
         if result.get('success'):
-            print(f"[CHECK-IN] Re-check-in success for user={current_user_id} (log #{len(time_logs)})")
-            return jsonify({'success': True, 'record': result['record']}), 201
+            print(f"[CHECK-IN] Re-check-in success for user={current_user_id} session={session} (log #{len(time_logs)})")
+            return jsonify({'success': True, 'record': result['record'], 'session': session, 'status': attendance_status}), 201
         return jsonify({'error': result.get('error', 'Check-in failed')}), 400
 
     # No record yet — create fresh
@@ -484,10 +561,15 @@ def record_checkin():
         'livenessVerified':    liveness_verified,
         'locationDisabled':    location_disabled,
         'status':    attendance_status,
+        'session':   session,
         'createdAt': now_iso,
         # New: array of individual time-log pairs
         'timeLogs': [new_log_entry],
     }
+    if session == 'morning':
+        record['morningSession'] = 'checked_in'
+    elif session == 'afternoon':
+        record['afternoonSession'] = 'checked_in'
     if face_photo_url:
         record['checkInFacePhotoUrl'] = face_photo_url
 
@@ -498,8 +580,8 @@ def record_checkin():
         return jsonify({'error': f'Failed to save record: {str(e)}'}), 500
 
     if result.get('success'):
-        print(f"[CHECK-IN] Success for user={current_user_id}")
-        return jsonify({'success': True, 'record': result['record']}), 201
+        print(f"[CHECK-IN] Success for user={current_user_id} session={session}")
+        return jsonify({'success': True, 'record': result['record'], 'session': session, 'status': attendance_status}), 201
 
     print(f"[ERROR] Check-in failed: {result.get('error')}")
     return jsonify({'error': result.get('error', 'Check-in failed')}), 400
@@ -548,7 +630,7 @@ def record_checkout():
                 )
                 print(f"[CHECK-OUT RE-VERIFY] user={current_user_id} "
                       f"photo={photo_score:.3f} gray={gray_score:.3f}")
-                if photo_score < 0.30 and gray_score < 0.20:
+                if photo_score < 0.30 or gray_score < 0.20:
                     face_verified = False
                     return jsonify({
                         'error': 'Face verification failed. The submitted photo does not match your registered face.'
@@ -566,8 +648,24 @@ def record_checkout():
     if not face_verified:
         return jsonify({'error': 'Face verification required. Please retake your photo.'}), 400
 
-    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    today = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%Y-%m-%d')
 
+    # ── Lunch block for checkout ──────────────────────────────────────────────
+    try:
+        _settings_co = svc.get_settings()
+        _student_co  = svc.get_user(current_user_id)
+        def _t2(hhmm):
+            h, m = map(int, hhmm.split(':'))
+            return h * 60 + m
+        _mco = _t2((_student_co.get('ojtMorningCheckoutTime')   if _student_co else None) or _settings_co.get('ojtMorningCheckoutTime',  '12:00'))
+        _aci = _t2((_student_co.get('ojtAfternoonCheckinTime')   if _student_co else None) or _settings_co.get('ojtAfternoonCheckinTime', '13:00'))
+        _now_ph_co   = datetime.now(timezone.utc) + timedelta(hours=8)
+        _now_total_co = _now_ph_co.hour * 60 + _now_ph_co.minute
+        if _mco <= _now_total_co < _aci:
+            return jsonify({'error': 'Attendance not allowed during lunch break (12:00–1:00 PM)'}), 400
+    except Exception:
+        pass  # if schedule load fails, do not block checkout
+    # ─────────────────────────────────────────────────────────────────────────
     try:
         existing = svc.get_today_attendance(current_user_id, today)
     except Exception as e:
@@ -592,6 +690,7 @@ def record_checkout():
 
     # Close the open entry
     entry = time_logs[open_idx]
+    session = entry.get('session', 'morning')
     entry['checkOut'] = check_out_iso
     entry['checkOutLocation'] = {
         'latitude':  latitude,
@@ -606,11 +705,12 @@ def record_checkout():
         print(f"[CHECK-OUT] WARNING: No face_photo_url available to save")
     entry['checkOutFaceVerified'] = face_verified
     entry['locationDisabled']     = location_disabled
+    session_hours = 0.0
     try:
         ci_dt = datetime.fromisoformat(entry['checkIn'])
-        entry['workHours'] = round(
-            (check_out_time - ci_dt).total_seconds() / 3600, 2
-        )
+        session_hours = round((check_out_time - ci_dt).total_seconds() / 3600, 2)
+        entry['workHours'] = session_hours
+        entry['hours'] = session_hours  # alias per spec
     except Exception:
         pass
     time_logs[open_idx] = entry
@@ -619,6 +719,19 @@ def record_checkout():
     total_hours = sum(
         float(e.get('workHours') or 0) for e in time_logs if e.get('checkOut')
     )
+
+    # Compute overall record status
+    has_open = any(e.get('checkIn') and not e.get('checkOut') for e in time_logs)
+    if has_open:
+        overall_status = 'incomplete'
+    else:
+        # Use the status of the last completed timeLogs entry
+        completed = [e for e in time_logs if e.get('checkOut')]
+        if completed:
+            last_status = completed[-1].get('status', existing.get('status', 'present'))
+            overall_status = last_status if last_status in ('present', 'late', 'absent') else existing.get('status', 'present')
+        else:
+            overall_status = existing.get('status', 'present')
 
     update_data = {
         'timeLogs':             time_logs,
@@ -633,8 +746,13 @@ def record_checkout():
         'checkOutFaceVerified': face_verified,
         'locationDisabled':     location_disabled,
         'workHours':            round(total_hours, 2),
+        'status':               overall_status,
         'updatedAt':            check_out_iso,
     }
+    if session == 'morning':
+        update_data['morningSession'] = 'completed'
+    elif session == 'afternoon':
+        update_data['afternoonSession'] = 'completed'
     if face_photo_url:
         update_data['checkOutFacePhotoUrl'] = face_photo_url
 
@@ -644,7 +762,13 @@ def record_checkout():
         return jsonify({'error': f'Failed to update record: {str(e)}'}), 500
 
     if result.get('success'):
-        return jsonify({'success': True, 'record': result['record']}), 200
+        return jsonify({
+            'success': True,
+            'record': result['record'],
+            'session': session,
+            'sessionHours': session_hours,
+            'totalHours': round(total_hours, 2),
+        }), 200
 
     return jsonify({'error': result.get('error', 'Check-out failed')}), 400
 
@@ -774,7 +898,8 @@ def get_today_attendance():
     """Get today's attendance record for the current user."""
     svc = _get_service()
     current_user_id = get_jwt_identity()
-    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    # Use Philippine Time (UTC+8) so the date matches the stored record date.
+    today = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%Y-%m-%d')
     record = svc.get_today_attendance(current_user_id, today)
     return jsonify(record), 200
 

@@ -860,9 +860,14 @@ def record_checkout():
 
         return update_data
 
+    print(
+        f"[CHECK-OUT] user={current_user_id} record={existing.get('id')} "
+        f"attempting mutate"
+    )
     try:
         result = svc.mutate_attendance_record(existing['id'], _checkout_mutation)
     except Exception as e:
+        print(f"[CHECK-OUT] mutate raised: {type(e).__name__}: {e}")
         return jsonify({'error': f'Failed to update record: {str(e)}'}), 500
 
     if result.get('success'):

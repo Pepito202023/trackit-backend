@@ -1677,8 +1677,11 @@ class FirebaseService:
 
                 @firestore.transactional
                 def _create_once(transaction):
-                    snapshot = transaction.get(doc_ref)
-                    if snapshot.exists:
+                    # google-cloud-firestore >=2.x returns a generator of
+                    # snapshots from Transaction.get(), not a single snapshot.
+                    snapshots = list(transaction.get(doc_ref))
+                    snapshot = snapshots[0] if snapshots else None
+                    if snapshot is None or not snapshot.exists:
                         existing = snapshot.to_dict() or {}
                         existing['id'] = snapshot.id
                         return {
@@ -1708,7 +1711,10 @@ class FirebaseService:
                 'record': {**clean_record, 'id': record_id},
             }
         except Exception as e:
-            print(f"Error creating attendance record once: {e}")
+            print(
+                f"Error creating attendance record once {record_id}: "
+                f"{type(e).__name__}: {e}"
+            )
             return {
                 'success': False,
                 'error': 'Failed to create attendance record'
@@ -1727,8 +1733,11 @@ class FirebaseService:
 
                 @firestore.transactional
                 def _mutate(transaction):
-                    snapshot = transaction.get(doc_ref)
-                    if not snapshot.exists:
+                    # google-cloud-firestore >=2.x returns a generator of
+                    # snapshots from Transaction.get(), not a single snapshot.
+                    snapshots = list(transaction.get(doc_ref))
+                    snapshot = snapshots[0] if snapshots else None
+                    if snapshot is None or not snapshot.exists:
                         return {'success': False, 'error': 'Record not found'}
 
                     current = snapshot.to_dict() or {}
@@ -1750,6 +1759,10 @@ class FirebaseService:
 
                     clean_update = self._strip_none(
                         self._strip_base64_blobs(update_data)
+                    )
+                    print(
+                        f"[ATTENDANCE MUTATE] record={record_id} "
+                        f"fields={sorted(clean_update.keys())}"
                     )
                     transaction.update(doc_ref, clean_update)
 
@@ -1794,7 +1807,12 @@ class FirebaseService:
                 'record': self.hydrate_attendance_photos(current),
             }
         except Exception as e:
-            print(f"Error mutating attendance record: {e}")
+            # Log the real Firestore exception (code + message) — the client only
+            # gets a generic message, but Render logs need the actual cause.
+            print(
+                f"Error mutating attendance record {record_id}: "
+                f"{type(e).__name__}: {e}"
+            )
             return {
                 'success': False,
                 'error': 'Failed to update attendance record'

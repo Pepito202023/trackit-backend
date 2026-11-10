@@ -4,17 +4,27 @@ Full Create, Read, Update, Delete for the users collection in Firestore.
 """
 
 from flask import Blueprint, request, jsonify
-from flask_jwt_extended import jwt_required, get_jwt_identity
+from flask_jwt_extended import jwt_required, get_jwt_identity, get_jwt
+from datetime import datetime
 from services.firebase_service import FirebaseService
 from services.email_service import (
     generate_temp_password,
-    send_welcome_email,
+    send_account_setup_email,
+    WEB_BASE_URL,
     smtp_session,
     last_email_error,
 )
 import os
 import uuid
 import base64
+
+# Names that are role-based placeholders — rejected at creation time and
+# corrected at login time.
+PLACEHOLDER_NAMES = {
+    'adviser', 'coordinator', 'supervisor', 'chairperson', 'chairman',
+    'student', 'admin', 'administrator', 'user', 'test', 'new adviser',
+    'new user', 'staff', 'teacher', 'employee',
+}
 
 user_bp = Blueprint('users', __name__)
 
@@ -48,6 +58,31 @@ def _current_user_role(svc: FirebaseService) -> str:
     if not current:
         return ''
     return _effective_role(current.get('role', ''))
+
+
+def _send_account_setup_email(svc: FirebaseService, user: dict) -> tuple:
+    """Email the user a one-time password setup link (no plaintext password).
+    Returns (sent: bool, error: str|None)."""
+    email = (user.get('email') or '').strip()
+    if not email:
+        return False, 'User has no email address'
+    raw_token = svc.create_password_reset_token(email)
+    if not raw_token:
+        return False, 'Could not create setup token'
+    setup_link = f"{WEB_BASE_URL}/reset_password.html?token={raw_token}"
+    try:
+        sent = send_account_setup_email(
+            email,
+            user.get('name') or 'User',
+            user.get('role') or 'user',
+            user.get('idNumber') or '',
+            setup_link,
+        )
+        if not sent:
+            return False, last_email_error() or 'Email send failed'
+        return True, None
+    except Exception as e:
+        return False, str(e)
 
 
 def _upload_to_firebase_storage(image_bytes: bytes, destination_path: str):
@@ -113,6 +148,11 @@ def _with_public_photos(user):
     for key in ('profilePicture', 'avatar', 'facePhotoUrl'):
         if user.get(key):
             user[key] = _public_photo_url(user[key])
+    # Clean up stale 'adviser' field that mistakenly stores the student's own name
+    own_name = (user.get('name') or '').strip().lower()
+    adviser_field = (user.get('adviser') or '').strip().lower()
+    if adviser_field and adviser_field == own_name:
+        user.pop('adviser', None)
     return user
 
 
@@ -139,6 +179,12 @@ def create_user():
 
     if not name:
         return jsonify({'error': 'Full name is required'}), 400
+    # Fix 4: Reject placeholder/role names — coordinators must enter a real name
+    if name.strip().lower() in PLACEHOLDER_NAMES:
+        return jsonify({
+            'success': False,
+            'error': "Please enter the user's real full name, not a role or placeholder."
+        }), 400
     if not email and not id_number:
         return jsonify({'error': 'Email or ID number is required'}), 400
     # Validate email format
@@ -174,6 +220,24 @@ def create_user():
 
     if result.get('success'):
         user = result['user']
+        # Fix 6: If an adviserId was provided (e.g. when creating a student),
+        # link the student to the adviser on the newly created document.
+        # Non-fatal: log the error but do not fail the whole creation.
+        adviser_id_for_create = (data.get('adviserId') or '').strip()
+        if adviser_id_for_create and user.get('id'):
+            try:
+                adviser_doc = svc.get_user(adviser_id_for_create)
+                if adviser_doc and _effective_role(adviser_doc.get('role', '')) == 'adviser':
+                    adviser_name_for_create = adviser_doc.get('name', '')
+                    svc.update_user(user['id'], {
+                        'adviserId': adviser_id_for_create,
+                        'adviserName': adviser_name_for_create,
+                    })
+                    user['adviserId'] = adviser_id_for_create
+                    user['adviserName'] = adviser_name_for_create
+            except Exception as adv_err:
+                print(f"[CREATE] Could not assign adviserId at creation: {adv_err}")
+
         # Mark account as requiring a password change on first login
         if is_temp and user.get('id'):
             try:
@@ -181,39 +245,29 @@ def create_user():
             except Exception:
                 pass
 
-        # Send welcome email synchronously — Gunicorn timeout is 120s which is
-        # more than enough for SMTP. Daemon threads get killed by Gunicorn when
-        # the request finishes, so we must send in-request.
+        # Send account setup email (one-time password link — never plaintext).
+        # Accounts without an email cannot receive the link; for those we fall
+        # back to the legacy temp-password flow.
         email_sent = False
         email_error = None
-        if is_temp:
+        user_id = user.get('id', '')
+        if email:
             user_payload = {**user, 'idNumber': id_number or user.get('idNumber', '')}
-            user_id = user.get('id', '')
+            email_sent, email_error = _send_account_setup_email(svc, user_payload)
             try:
-                email_sent = send_welcome_email(user_payload, password)
-                if not email_sent:
-                    email_error = last_email_error() or 'Email send failed'
-                else:
-                    # Mark email as sent on the user record
-                    if user_id:
-                        try:
-                            svc.update_user(user_id, {'_emailSent': True})
-                        except Exception:
-                            pass
-            except Exception as mail_err:
-                email_error = str(mail_err)
-                print(f"[CREATE] Email error: {mail_err}")
+                svc.update_user(user_id, {'_emailSent': email_sent})
+            except Exception as fw_err:
+                print(f"[CREATE] Firestore metadata write failed: {fw_err}")
+        elif is_temp:
+            # No email address — the setup link cannot be delivered. The
+            # coordinator can use resend-email after adding one, or the user
+            # can use the in-app forgot-password flow.
+            email_error = 'User has no email address'
 
         user.pop('password', None)
         response = {**user, 'emailSent': email_sent}
         if email_error:
             response['emailError'] = email_error
-        # Store the temp password on the user record so it can be re-sent later
-        if is_temp and user.get('id'):
-            try:
-                svc.update_user(user['id'], {'_tempPw': password})
-            except Exception:
-                pass
         return jsonify(response), 201
     return jsonify({'error': result.get('error', 'Failed to create user')}), 400
 
@@ -282,37 +336,24 @@ def resend_welcome_email(user_id):
     if not email:
         return jsonify({'error': 'User has no email address — cannot send email'}), 400
 
-    # Use the stored temp password if still available; otherwise make a new one
-    temp_pw = (user.get('_tempPw') or '').strip()
-    reset_pw = not temp_pw
-    if reset_pw:
-        temp_pw = generate_temp_password()
-        # Reset the password so the new temp one is usable
-        try:
-            if svc.db:
-                svc.db.collection('users').document(user_id).update({
-                    'password': temp_pw,
-                    'mustChangePassword': True,
-                    '_tempPw': temp_pw,
-                })
-            else:
-                svc.update_user(user_id, {
-                    'password': temp_pw,
-                    'mustChangePassword': True,
-                    '_tempPw': temp_pw,
-                })
-        except Exception as e:
-            return jsonify({'error': f'Failed to reset password: {e}'}), 500
+    # Ensure the account has a Firebase Auth identity, then email a fresh
+    # one-time setup link. Never resend plaintext passwords.
+    if not user.get('firebaseUid'):
+        uid = svc.ensure_firebase_auth_user(
+            email, None, user.get('name', ''))
+        if uid:
+            try:
+                svc.db.collection('users').document(user_id).update({'firebaseUid': uid})
+                user['firebaseUid'] = uid
+            except Exception:
+                pass
 
-    ok = send_welcome_email(
-        {**user, 'idNumber': user.get('idNumber', '')},
-        temp_pw
-    )
-    if ok:
-        return jsonify({'success': True, 'message': f'Credentials email sent to {email}'}), 200
+    email_sent, email_error = _send_account_setup_email(svc, user)
+    if email_sent:
+        return jsonify({'success': True, 'message': f'Account setup email sent to {email}'}), 200
     return jsonify({
         'success': False,
-        'error': last_email_error() or (
+        'error': email_error or (
             'Failed to send email. '
             'Check TRACKIT_EMAIL_FROM and TRACKIT_EMAIL_PASSWORD in backend/.env, '
             'then restart the backend.'
@@ -476,6 +517,52 @@ def set_my_company():
 
 
 # ─────────────────────────────────────────────
+# UPDATE MY NAME  PUT /api/users/me/name
+# ─────────────────────────────────────────────
+@user_bp.route('/me/name', methods=['PUT'])
+@jwt_required()
+def update_my_name():
+    """Any authenticated user can update their own display name."""
+    svc = _get_service()
+    current_user_id = get_jwt_identity()
+
+    data = request.get_json() or {}
+
+    # Accept { first_name, last_name } or { name }
+    first_name = data.get('first_name')
+    last_name  = data.get('last_name')
+    name_field = data.get('name')
+
+    if first_name is not None or last_name is not None:
+        full_name = (
+            (str(first_name or '').strip() + ' ' + str(last_name or '').strip()).strip()
+        )
+    elif name_field is not None:
+        full_name = str(name_field).strip()
+    else:
+        return jsonify({'error': 'first_name, last_name, or name is required'}), 400
+
+    if not full_name:
+        return jsonify({'error': 'Name must not be empty'}), 400
+
+    try:
+        user = svc.get_user(current_user_id)
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+
+        result = svc.update_user(current_user_id, {'name': full_name})
+    except Exception as e:
+        return jsonify({'error': 'Database error', 'details': str(e)}), 500
+
+    if not result.get('success'):
+        return jsonify({'error': result.get('error', 'Failed to update name')}), 400
+
+    updated = result.get('user') or {}
+    updated.pop('password', None)
+    return jsonify(updated), 200
+
+
+# ─────────────────────────────────────────────
 # MY STUDENTS  GET /api/users/my-students
 # ─────────────────────────────────────────────
 @user_bp.route('/my-students', methods=['GET'])
@@ -494,6 +581,48 @@ def get_my_students():
         students = svc.get_students_by_supervisor(current_user_id)
     else:
         students = svc.get_students_by_adviser(current_user_id)
+        # Fallback: if no students are directly assigned by adviserId,
+        # show students from the same company (matched via company name on the HTE record)
+        if not students:
+            try:
+                all_companies = svc.get_companies() if hasattr(svc, 'get_companies') else []
+                adviser_name = (caller.get('name') or '').strip().lower()
+                linked_company = None
+                for c in all_companies:
+                    c_adviser = (c.get('adviser') or c.get('adviserName') or '').strip().lower()
+                    if c_adviser and c_adviser == adviser_name:
+                        linked_company = c
+                        break
+                if linked_company:
+                    c_name = (linked_company.get('name') or '').strip().lower()
+                    c_id   = linked_company.get('id') or ''
+                    adv_id_from_company = (linked_company.get('adviserId') or '').strip()
+                    all_users = svc.get_all_users()
+                    students = [
+                        u for u in all_users
+                        if _effective_role(u.get('role', '')) == 'student'
+                        and (
+                            (u.get('companyId') or '') == c_id
+                            or (u.get('company') or u.get('companyName') or '').strip().lower() == c_name
+                        )
+                    ]
+                    # Strip passwords; also backfill adviserId on students missing it
+                    for u in students:
+                        u.pop('password', None)
+                        u.pop('_tempPw', None)
+                        # If this student doesn't have adviserId set, backfill it now
+                        if adv_id_from_company and not u.get('adviserId'):
+                            try:
+                                svc.update_user(u['id'], {
+                                    'adviserId':   adv_id_from_company,
+                                    'adviserName': linked_company.get('adviser') or linked_company.get('adviserName') or '',
+                                })
+                                u['adviserId']   = adv_id_from_company
+                                u['adviserName'] = linked_company.get('adviser') or linked_company.get('adviserName') or ''
+                            except Exception:
+                                pass
+            except Exception as fb_err:
+                print(f'[my-students] company fallback error: {fb_err}')
     return jsonify(students), 200
 
 
@@ -660,16 +789,16 @@ def import_users():
                     temp_pw = provided_pw
                     svc.change_password(existing_user['id'], existing_user.get('password', ''), temp_pw)
                     update_fields['mustChangePassword'] = True
-                    update_fields['_tempPw'] = temp_pw
 
                 if update_fields:
                     svc.update_user(existing_user['id'], update_fields)
 
-                # Send email only if a new password was explicitly set
-                if temp_pw:
+                # Email a fresh setup link whenever the account has an email —
+                # both for password resets and to deliver the Firebase Auth link.
+                if (email or existing_user.get('email')):
                     merged = {**existing_user, **update_fields}
-                    pending_emails.append((merged, temp_pw, existing_user.get('id', ''),
-                                          email or id_number, name))
+                    pending_emails.append((merged, existing_user.get('id', ''),
+                                          email or existing_user.get('email', ''), name))
 
                 updated += 1
 
@@ -691,11 +820,11 @@ def import_users():
                 if result.get('success'):
                     new_user = result['user']
                     all_users.append(new_user)
-                    # Mark as requiring password change and keep temp password for retry
+                    # Mark as requiring password change — user sets it via the
+                    # emailed one-time setup link.
                     if new_user.get('id'):
                         svc.update_user(new_user['id'], {
                             'mustChangePassword': True,
-                            '_tempPw': temp_pw,
                         })
                     payload = {
                         **new_user,
@@ -704,9 +833,12 @@ def import_users():
                         'role': role or new_user.get('role', ''),
                         'name': name or new_user.get('name', ''),
                     }
-                    print(f"[IMPORT] Row {row_num}: Queuing welcome email to {payload.get('email')}")
-                    pending_emails.append((payload, temp_pw, new_user.get('id', ''),
-                                          email or id_number, name))
+                    if payload.get('email'):
+                        print(f"[IMPORT] Row {row_num}: Queuing setup email to {payload.get('email')}")
+                        pending_emails.append((payload, new_user.get('id', ''),
+                                              payload.get('email', ''), name))
+                    else:
+                        errors.append(f'Row {row_num} ({name}): account created but no email — setup link not sent')
                     created += 1
                 else:
                     err_msg = result.get('error', 'Unknown error')
@@ -722,12 +854,23 @@ def import_users():
     import threading
 
     def _send_all(pending, svc_ref):
-        print(f"[IMPORT] Background thread: sending {len(pending)} email(s)...")
+        print(f"[IMPORT] Background thread: sending {len(pending)} setup email(s)...")
         with smtp_session() as mailer:
-            for payload, pw, uid, addr, uname in pending:
-                ok = send_welcome_email(payload, pw, smtp=mailer)
-                print(f"[IMPORT] Email to {addr}: {'OK' if ok else 'FAILED'}")
-                # Mark email as sent/failed on the user record
+            for payload, uid, addr, uname in pending:
+                # Provision the Firebase Auth identity if the profile predates it
+                if not payload.get('firebaseUid') and addr:
+                    try:
+                        fb_uid = svc_ref.ensure_firebase_auth_user(addr, None, payload.get('name', ''))
+                        if fb_uid and uid:
+                            svc_ref.db.collection('users').document(uid).update({'firebaseUid': fb_uid})
+                            payload['firebaseUid'] = fb_uid
+                    except Exception as prov_err:
+                        print(f"[IMPORT] Auth provisioning failed for {addr}: {prov_err}")
+                try:
+                    ok, err = _send_account_setup_email(svc_ref, payload)
+                except Exception as mail_err:
+                    ok, err = False, str(mail_err)
+                print(f"[IMPORT] Setup email to {addr}: {'OK' if ok else 'FAILED — ' + str(err)}")
                 if uid:
                     try:
                         svc_ref.update_user(uid, {'_emailSent': ok, '_emailSentAt': __import__('datetime').datetime.now().isoformat()})
@@ -833,9 +976,109 @@ def update_user(user_id):
 
     result = svc.update_user(user_id, update_data)
 
+    # Handle password update separately (update_user strips it for safety)
+    new_password = data.get('password', '').strip()
+    if new_password and len(new_password) >= 6:
+        try:
+            from services.firebase_service import _hash_password
+            if svc.db:
+                svc.db.collection('users').document(user_id).update({
+                    'password': _hash_password(new_password),
+                    'mustChangePassword': False,
+                    '_tempPw': '',
+                })
+            else:
+                if user_id in svc.users_db:
+                    svc.users_db[user_id]['password'] = _hash_password(new_password)
+                    svc.users_db[user_id]['mustChangePassword'] = False
+                    svc._save_users_to_file()
+        except Exception as pw_err:
+            print(f'[update_user] password update failed: {pw_err}')
+
     if result.get('success'):
         return jsonify(_with_public_photos(result['user'])), 200
     return jsonify({'error': result.get('error', 'Update failed')}), 400
+
+
+# ─────────────────────────────────────────────
+# ASSIGN STUDENTS  POST /api/users/<adviser_id>/assign-students
+# Allows a coordinator or chairperson to bulk-assign students to an adviser.
+# ─────────────────────────────────────────────
+@user_bp.route('/<adviser_id>/assign-students', methods=['POST'])
+@jwt_required()
+def assign_students_to_adviser(adviser_id):
+    """
+    Assign one or more students to an adviser.
+    Body: { "studentIds": ["id1", "id2"] }
+    Only coordinator and chairperson roles may call this endpoint.
+    """
+    svc = _get_service()
+    caller_role = _current_user_role(svc)
+    if caller_role not in ('coordinator', 'chairman'):
+        return jsonify({'error': 'Only coordinators and chairpersons can assign students'}), 403
+
+    adviser = svc.get_user(adviser_id)
+    if not adviser:
+        return jsonify({'error': 'Adviser not found'}), 404
+    if _effective_role(adviser.get('role', '')) != 'adviser':
+        return jsonify({'error': 'Target user is not an adviser'}), 400
+
+    data = request.get_json() or {}
+    student_ids = data.get('studentIds') or []
+    if not isinstance(student_ids, list) or not student_ids:
+        return jsonify({'error': 'studentIds must be a non-empty list'}), 400
+
+    adviser_name = adviser.get('name', '')
+    assigned = 0
+    errors = []
+    for sid in student_ids:
+        sid = (sid or '').strip()
+        if not sid:
+            continue
+        student = svc.get_user(sid)
+        if not student:
+            errors.append(f'{sid}: student not found')
+            continue
+        if _effective_role(student.get('role', '')) != 'student':
+            errors.append(f'{sid}: user is not a student')
+            continue
+        try:
+            svc.update_user(sid, {'adviserId': adviser_id, 'adviserName': adviser_name})
+            assigned += 1
+        except Exception as e:
+            errors.append(f'{sid}: {str(e)}')
+
+    return jsonify({'success': True, 'assigned': assigned, 'errors': errors}), 200
+
+
+# ─────────────────────────────────────────────
+# UNASSIGN ONE STUDENT  DELETE /api/users/<adviser_id>/assign-students/<student_id>
+# Removes a student from a specific adviser.
+# ─────────────────────────────────────────────
+@user_bp.route('/<adviser_id>/assign-students/<student_id>', methods=['DELETE'])
+@jwt_required()
+def unassign_student_from_adviser(adviser_id, student_id):
+    """
+    Remove a student from an adviser's list.
+    Only coordinator and chairperson roles may call this endpoint.
+    """
+    svc = _get_service()
+    caller_role = _current_user_role(svc)
+    if caller_role not in ('coordinator', 'chairman'):
+        return jsonify({'error': 'Only coordinators and chairpersons can unassign students'}), 403
+
+    student = svc.get_user(student_id)
+    if not student:
+        return jsonify({'error': 'Student not found'}), 404
+    if _effective_role(student.get('role', '')) != 'student':
+        return jsonify({'error': 'Target user is not a student'}), 400
+    if student.get('adviserId') != adviser_id:
+        return jsonify({'error': 'Student is not assigned to this adviser'}), 400
+
+    result = svc.update_user(student_id, {'adviserId': None, 'adviserName': None})
+    if result.get('success'):
+        return jsonify({'success': True}), 200
+    return jsonify({'error': result.get('error', 'Failed to unassign student')}), 400
 
 
 # ─────────────────────────────────────────────
@@ -914,6 +1157,81 @@ def unassign_student(user_id):
 # ─────────────────────────────────────────────
 # DELETE  DELETE /api/users/<user_id>
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# STUDENT RESET  POST /api/users/<user_id>/reset
+# Clears face registration + pending internship plan so student can re-register.
+# Only coordinators and chairmen may call this.
+# Preserves attendance history, OJT hours, evaluations, and completed records.
+# ─────────────────────────────────────────────
+@user_bp.route('/<user_id>/reset', methods=['POST'])
+@jwt_required()
+def reset_student(user_id):
+    """
+    Reset a student's face registration and internship plan.
+    Preserves all attendance, OJT hours, and historical records.
+    """
+    svc = _get_service()
+    current_user_id = get_jwt_identity()
+    caller = svc.get_user(current_user_id)
+    if not caller:
+        return jsonify({'error': 'Caller not found'}), 404
+
+    caller_role = _effective_role(caller.get('role', ''))
+    if caller_role not in ('coordinator', 'chairman'):
+        return jsonify({'error': 'Only coordinators and chairpersons can reset student accounts'}), 403
+
+    student = svc.get_user(user_id)
+    if not student:
+        return jsonify({'error': 'Student not found'}), 404
+    if _effective_role(student.get('role', '')) != 'student':
+        return jsonify({'error': 'This endpoint is for student accounts only'}), 400
+
+    # Fields to clear — face registration + plan status
+    reset_data = {
+        'facePhotoUrl':       None,
+        'faceData':           None,
+        'faceDescriptor':     None,
+        'faceThumb':          None,
+        'faceRegisteredAt':   None,
+        'resetAt':            datetime.now().isoformat(),
+        'resetBy':            current_user_id,
+        'resetByName':        caller.get('name', ''),
+    }
+    svc.update_user(user_id, reset_data)
+
+    # Delete face records in face_registrations collection
+    try:
+        if svc.db:
+            for doc in svc.db.collection('face_registrations') \
+                    .where('userId', '==', user_id).stream():
+                doc.reference.delete()
+    except Exception as e:
+        print(f'[reset_student] face_registrations cleanup error: {e}')
+
+    # Withdraw pending / submitted internship plans (preserve assigned ones)
+    try:
+        plans = svc.get_application_plans(student_id=user_id) or []
+        for plan in plans:
+            if plan.get('status') in ('pending', 'submitted'):
+                svc.update_application_plan(plan['id'], {
+                    'status':      'withdrawn',
+                    'withdrawnAt': datetime.now().isoformat(),
+                    'withdrawnBy': current_user_id,
+                    'withdrawNote': 'Reset by coordinator/chairperson',
+                })
+    except Exception as e:
+        print(f'[reset_student] plan withdrawal error: {e}')
+
+    print(f'[reset_student] Student {user_id} reset by {current_user_id} ({caller_role})')
+    return jsonify({
+        'success': True,
+        'message': f'Student {student.get("name", user_id)} has been reset. They can now register a new face and submit a new internship plan.',
+        'studentId': user_id,
+        'resetBy':   current_user_id,
+        'resetAt':   reset_data['resetAt'],
+    }), 200
+
+
 @user_bp.route('/<user_id>', methods=['DELETE'])
 @jwt_required()
 def delete_user(user_id):

@@ -85,6 +85,48 @@ def _get_service() -> FirebaseService:
     return _firebase_service
 
 
+# ── Firebase Auth password sign-in (Identity Toolkit REST) ───────────────────
+# The web API key is public (already shipped in web_admin/js/firebase-config.js).
+_FIREBASE_WEB_API_KEY = os.environ.get(
+    'FIREBASE_WEB_API_KEY', 'AIzaSyDfy6UmFks_Onb1sf4RN4APK5uMCG4NsZ4'
+)
+
+
+def _firebase_password_sign_in(email: str, password: str) -> dict:
+    """Authenticate against Firebase Auth. Returns {'uid': ...} on success or
+    {'error': '<code>'} on failure. Network/config errors return 'unavailable'."""
+    import requests as req
+    try:
+        resp = req.post(
+            'https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword',
+            params={'key': _FIREBASE_WEB_API_KEY},
+            json={'email': email, 'password': password, 'returnSecureToken': True},
+            timeout=15,
+        )
+        data = resp.json()
+    except Exception as e:
+        print(f"[LOGIN] Firebase Auth request failed: {e}")
+        return {'error': 'unavailable'}
+    if resp.status_code == 200 and data.get('idToken'):
+        # Verify the token server-side with the Admin SDK for a trusted UID.
+        try:
+            from firebase_admin import auth as fb_auth
+            decoded = fb_auth.verify_id_token(data['idToken'])
+            return {'uid': decoded.get('uid') or data.get('localId')}
+        except Exception as e:
+            print(f"[LOGIN] Firebase idToken verification failed: {e}")
+            return {'uid': data.get('localId')}
+    err = (data.get('error') or {}).get('message', '')
+    mapping = {
+        'EMAIL_NOT_FOUND': 'user_not_found',
+        'INVALID_PASSWORD': 'wrong_password',
+        'INVALID_LOGIN_CREDENTIALS': 'wrong_password',
+        'USER_DISABLED': 'disabled',
+        'TOO_MANY_ATTEMPTS_TRY_LATER': 'rate_limited',
+    }
+    return {'error': mapping.get(err, err or 'unknown')}
+
+
 @auth_bp.route('/login', methods=['POST'])
 def login():
     """User login endpoint"""
@@ -103,8 +145,38 @@ def login():
         return jsonify({'error': 'Password is required'}), 400
 
     # Support both email and ID number login
+    result = None
     if email:
-        result = svc.verify_user(email, password, role)
+        # ── Firebase Auth first (official web auth) ──────────────────────────
+        fb = _firebase_password_sign_in(email.lower(), password)
+        if fb.get('uid'):
+            user = svc.find_user_by_firebase_uid(fb['uid'])
+            if not user:
+                # Profile may predate firebaseUid — fall back to email lookup.
+                matches = svc.find_users_by_email(email)
+                user = matches[0] if matches else None
+            if user:
+                result = {'success': True, 'user': user}
+            else:
+                return jsonify({
+                    'error': 'Your account was authenticated but has no Track-IT '
+                             'profile. Contact the system administrator.'
+                }), 403
+        elif fb.get('error') == 'disabled':
+            return jsonify({'error': 'This account has been disabled. Contact the system administrator.'}), 403
+        elif fb.get('error') == 'rate_limited':
+            return jsonify({'error': 'Too many attempts. Please wait a few minutes and try again.'}), 429
+        elif fb.get('error') == 'wrong_password':
+            # Firebase account exists — try the legacy Firestore hash too so
+            # unmigrated/mobile accounts with the old password still work.
+            legacy = svc.verify_user(email, password, role)
+            if legacy.get('success'):
+                result = legacy
+            else:
+                return jsonify({'error': 'Incorrect password. Please try again.'}), 401
+        else:
+            # user_not_found / unavailable / unknown → legacy Firestore path
+            result = svc.verify_user(email, password, role)
     elif id_number:
         result = svc.verify_user_by_id(id_number, password, role)
     else:

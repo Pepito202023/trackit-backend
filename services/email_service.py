@@ -28,7 +28,7 @@ from pathlib import Path
 SMTP_HOST         = 'smtp.gmail.com'
 SMTP_SSL_PORT     = 465       # Gmail SSL — faster and more reliable than STARTTLS 587
 SMTP_STARTTLS_PORT = 587
-SMTP_TIMEOUT      = 30        # 30s is enough; Render's network is fast
+SMTP_TIMEOUT      = 45        # 45s for Render's slower network
 
 _LAST_ERROR = None
 
@@ -115,8 +115,8 @@ def _open_smtp():
         return None
 
     attempts = [
-        ('ssl', SMTP_SSL_PORT),
         ('starttls', SMTP_STARTTLS_PORT),
+        ('ssl', SMTP_SSL_PORT),
     ]
     last_err = None
     for mode, port in attempts:
@@ -207,9 +207,11 @@ def _deliver(server, to: str, subject: str, html_body: str) -> bool:
         _set_error(f'Invalid recipient address: {to!r}')
         return False
     msg = MIMEMultipart('alternative')
-    msg['Subject'] = subject
-    msg['From']    = f'TrackIt OJT System <{email_from}>'
-    msg['To']      = to
+    msg['Subject']  = subject
+    msg['From']     = f'TRACK-IT OJT System <{email_from}>'
+    msg['To']       = to
+    msg['Reply-To'] = email_from
+    msg['X-Mailer'] = 'TRACK-IT OJT Monitoring System'
     msg.attach(MIMEText(html_body, 'html', 'utf-8'))
     try:
         server.sendmail(email_from, [to], msg.as_string())
@@ -319,8 +321,8 @@ def send_staff_welcome(to: str, name: str, role: str, temp_password: str,
 
 <p>If you have any questions, contact your OJT Coordinator.</p>
 """
-    return _send(to, f'Your TrackIt Account — {role_label} Login Credentials', _base_html(
-        f'Welcome to TrackIt, {name}!', body), smtp=smtp)
+    return _send(to, f'TRACK-IT: Your {role_label} Account is Ready', _base_html(
+        f'Welcome to TRACK-IT, {name}!', body), smtp=smtp)
 
 
 def send_student_welcome(to: str, name: str, id_number: str,
@@ -359,8 +361,8 @@ def send_student_welcome(to: str, name: str, id_number: str,
 
 <p>If you need assistance, contact your OJT Coordinator or Adviser.</p>
 """
-    return _send(to, 'Your TrackIt Account — Mobile App Login Credentials', _base_html(
-        f'Welcome to TrackIt, {name}!', body), smtp=smtp)
+    return _send(to, 'TRACK-IT: Your Student Account is Ready', _base_html(
+        f'Welcome to TRACK-IT, {name}!', body), smtp=smtp)
 
 
 def send_welcome_email(user: dict, temp_password: str, smtp=None) -> bool:
@@ -382,6 +384,53 @@ def send_welcome_email(user: dict, temp_password: str, smtp=None) -> bool:
     else:
         return send_staff_welcome(email, name, role, temp_password,
                                   login_identifier=email, smtp=smtp)
+
+
+def send_account_setup_email(to: str, name: str, role: str, id_number: str,
+                             setup_link: str, smtp=None) -> bool:
+    """
+    Send the TRACK-IT account setup email with a one-time password setup link.
+    Contains NO plaintext password — the user sets their own password.
+    """
+    email = (to or '').strip()
+    name = (name or 'User').strip()
+    role_label = (role or 'user').strip().title()
+    id_number = (id_number or '').strip()
+    if not email:
+        return False
+    id_row = (f'<tr><td style="padding:8px 12px;color:#666">ID Number</td>'
+              f'<td style="padding:8px 12px;font-weight:600">{id_number}</td></tr>') if id_number else ''
+    body = f"""
+<p>Hello <strong>{name}</strong>,</p>
+<p>Your <strong>TRACK-IT</strong> account has been created. Use the button below
+to set your password and activate your account. <strong>This link expires in 1 hour
+and can only be used once.</strong></p>
+
+<table style="border-collapse:collapse;margin:16px 0;font-size:14px">
+<tr><td style="padding:8px 12px;color:#666">System</td>
+    <td style="padding:8px 12px;font-weight:600">TRACK-IT OJT Attendance System</td></tr>
+<tr><td style="padding:8px 12px;color:#666">Gmail Address</td>
+    <td style="padding:8px 12px;font-weight:600">{email}</td></tr>
+{id_row}
+<tr><td style="padding:8px 12px;color:#666">Assigned Role</td>
+    <td style="padding:8px 12px;font-weight:600">{role_label}</td></tr>
+</table>
+
+<a href="{setup_link}" class="btn">Set My Password →</a>
+
+<p style="margin-top:20px;font-size:13px;color:#666">
+  After setting your password, log in at the TRACK-IT login page using the
+  Gmail address above.</p>
+<p style="margin-top:16px;font-size:13px;color:#666">
+  If the button doesn't work, copy and paste this link into your browser:
+  <br><span style="font-family:monospace;font-size:12px;word-break:break-all">{setup_link}</span>
+</p>
+<div class="warn">
+  ⚠️ <strong>If you did not expect this email</strong>, you can safely ignore it —
+  your account password will not be changed.
+</div>
+"""
+    return _send(to, 'TRACK-IT: Set Up Your Account Password', _base_html('Account Setup', body), smtp=smtp)
 
 
 # ── Password reset email ──────────────────────────────────────────────────────

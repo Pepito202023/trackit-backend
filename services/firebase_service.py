@@ -404,6 +404,86 @@ class FirebaseService:
                     pass
         return user_data
 
+    # ── Firebase Authentication account helpers ──────────────────────────────
+    # Firestore stores the profile; Firebase Auth stores credentials. Every
+    # account with an email gets a linked Auth user so web login can use
+    # Firebase sign-in while the password hash remains for the mobile app.
+
+    def ensure_firebase_auth_user(self, email: str, password: str = None,
+                                  display_name: str = '') -> Optional[str]:
+        """Create or link a Firebase Auth account. Returns the UID or None."""
+        email = (email or '').strip().lower()
+        if not email:
+            return None
+        try:
+            try:
+                record = auth.create_user(
+                    email=email,
+                    password=password or None,
+                    display_name=(display_name or '').strip() or None,
+                )
+                print(f"[Auth] Created Firebase Auth user {record.uid} for {email}")
+                return record.uid
+            except auth.EmailAlreadyExistsError:
+                existing = auth.get_user_by_email(email)
+                if password:
+                    try:
+                        auth.update_user(existing.uid, password=password)
+                    except Exception as pw_err:
+                        print(f"[Auth] Could not sync password for {email}: {pw_err}")
+                print(f"[Auth] Linked existing Firebase Auth user {existing.uid} for {email}")
+                return existing.uid
+        except Exception as e:
+            print(f"[Auth] Firebase Auth provisioning failed for {email}: {e}")
+            return None
+
+    def sync_firebase_password(self, user_data: Dict, new_password: str):
+        """Best-effort mirror of a password change into Firebase Auth."""
+        if not new_password or not isinstance(user_data, dict):
+            return
+        uid = user_data.get('firebaseUid')
+        email = (user_data.get('email') or '').strip().lower()
+        try:
+            if uid:
+                auth.update_user(uid, password=new_password)
+            elif email:
+                record = auth.get_user_by_email(email)
+                auth.update_user(record.uid, password=new_password)
+        except Exception as e:
+            print(f"[Auth] Firebase password sync failed (uid={uid or '-'} email={email or '-'}): {e}")
+
+    def find_user_by_firebase_uid(self, uid: str) -> Optional[Dict]:
+        """Look up a Firestore user profile by its linked Firebase UID."""
+        uid = (uid or '').strip()
+        if not uid or not self.db:
+            return None
+        try:
+            for doc in self.db.collection('users').where('firebaseUid', '==', uid).limit(1).stream():
+                user_data = doc.to_dict()
+                user_data['id'] = doc.id
+                return self._normalize_user_role(user_data)
+        except Exception as e:
+            print(f"[Auth] find_user_by_firebase_uid({uid}) failed: {e}")
+        return None
+
+    def _provision_auth_for_new_user(self, user_data: Dict, plaintext_password: str,
+                                     doc_ref=None) -> Dict:
+        """Create the Firebase Auth account for a freshly created user doc and
+        store firebaseUid back on the profile. Best-effort — never fails creation."""
+        email = (user_data.get('email') or '').strip().lower()
+        if not email:
+            return user_data
+        uid = self.ensure_firebase_auth_user(email, plaintext_password, user_data.get('name', ''))
+        if not uid:
+            return user_data
+        user_data['firebaseUid'] = uid
+        if doc_ref is not None:
+            try:
+                doc_ref.update({'firebaseUid': uid})
+            except Exception as e:
+                print(f"[Auth] Could not store firebaseUid on user doc: {e}")
+        return user_data
+
     # Authentication Methods
     def _find_user_docs_by_email(self, email: str):
         """Return (doc_id, user_data) pairs for every user doc matching email.
@@ -582,6 +662,7 @@ class FirebaseService:
                         return {'success': False, 'error': 'An account with this email and role already exists'}
                 doc_ref = self.db.collection('users').add(user_data)
                 user_data['id'] = doc_ref[1].id
+                user_data = self._provision_auth_for_new_user(user_data, password, doc_ref.reference)
                 safe = dict(user_data)
                 safe.pop('password', None)
                 return {'success': True, 'user': safe}
@@ -594,6 +675,7 @@ class FirebaseService:
                 user_id = f"user_{len(self.users_db) + 1}"
                 new_user = dict(user_data)
                 new_user['id'] = user_id
+                new_user = self._provision_auth_for_new_user(new_user, password)
                 self.users_db[user_id] = new_user
                 self._save_users_to_file()
                 safe = dict(new_user)
@@ -661,6 +743,7 @@ class FirebaseService:
                 
                 doc_ref = self.db.collection('users').add(user_data)
                 user_data['id'] = doc_ref[1].id
+                user_data = self._provision_auth_for_new_user(user_data, password, doc_ref.reference)
                 safe = dict(user_data)
                 safe.pop('password', None)
                 return {
@@ -694,6 +777,8 @@ class FirebaseService:
                 # Students' company is set exclusively by the assignment flow.
                 if company and role != 'student':
                     new_user['company'] = company
+                new_user = self._provision_auth_for_new_user(new_user, password)
+                self.users_db[user_id] = new_user
                 self._save_users_to_file()
                 safe = dict(new_user)
                 safe.pop('password', None)
@@ -809,17 +894,24 @@ class FirebaseService:
         """Hash and store a new password for the user. Returns True on success."""
         try:
             hashed = _hash_password(plaintext_password)
+            user_data = None
             if self.db:
-                self.db.collection('users').document(user_id).update({
+                doc_ref = self.db.collection('users').document(user_id)
+                doc = doc_ref.get()
+                if doc.exists:
+                    user_data = doc.to_dict()
+                doc_ref.update({
                     'password': hashed,
                     'mustChangePassword': True,
                     'updatedAt': datetime.now().isoformat(),
                 })
             else:
                 if user_id in self.users_db:
+                    user_data = dict(self.users_db[user_id])
                     self.users_db[user_id]['password'] = hashed
                     self.users_db[user_id]['mustChangePassword'] = True
                     self._save_users_to_file()
+            self.sync_firebase_password(user_data or {}, plaintext_password)
             return True
         except Exception as e:
             print(f"[set_user_password] Failed for {user_id}: {e}")
@@ -857,6 +949,7 @@ class FirebaseService:
                 if stored and not _verify_password(stored, current_password):
                     return {'success': False, 'error': 'Current password is incorrect'}
                 doc_ref.update({'password': _hash_password(new_password)})
+                self.sync_firebase_password(user_data, new_password)
                 return {'success': True}
             else:
                 if user_id not in self.users_db:
@@ -865,6 +958,7 @@ class FirebaseService:
                 if stored and not _verify_password(stored, current_password):
                     return {'success': False, 'error': 'Current password is incorrect'}
                 self.users_db[user_id]['password'] = _hash_password(new_password)
+                self.sync_firebase_password(self.users_db[user_id], new_password)
                 self._save_users_to_file()
                 return {'success': True}
         except Exception as e:
@@ -1010,6 +1104,9 @@ class FirebaseService:
             if self.db:
                 for doc in self.db.collection('users').where('email', '==', email).stream():
                     doc.reference.update({'password': hashed, 'updatedAt': datetime.now(timezone.utc).isoformat()})
+                    user_data = doc.to_dict()
+                    user_data['id'] = doc.id
+                    self.sync_firebase_password(user_data, new_password)
                     updated_count += 1
             else:
                 if not hasattr(self, 'users_db'):
@@ -1018,6 +1115,7 @@ class FirebaseService:
                     if (u.get('email') or '').lower() == email:
                         u['password'] = hashed
                         u['updatedAt'] = datetime.now(timezone.utc).isoformat()
+                        self.sync_firebase_password(u, new_password)
                         updated_count += 1
                 if updated_count:
                     self._save_users_to_file()

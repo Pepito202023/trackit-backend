@@ -905,9 +905,24 @@ def import_users():
 @user_bp.route('', methods=['GET'])
 @jwt_required()
 def get_all_users():
-    """Get all users (passwords excluded)"""
+    """Get all users (passwords excluded).
+
+    Supervisors may only see students assigned to them — not the full user list.
+    All other privileged roles (coordinator, chairman, adviser) see all users.
+    """
     svc = _get_service()
+    caller_role = _current_user_role(svc)
     role_filter = request.args.get('role')
+
+    # Supervisors are restricted to their assigned students only.
+    if caller_role == 'supervisor':
+        current_user_id = get_jwt_identity()
+        users = svc.get_students_by_supervisor(current_user_id)
+        # Apply role filter (supervisor dashboard always requests role=student,
+        # but be safe and honour any explicit filter the caller passes)
+        if role_filter:
+            users = [u for u in users if _effective_role(u.get('role', '')) == _effective_role(role_filter)]
+        return jsonify([_with_public_photos(u) for u in users]), 200
 
     users = svc.get_all_users()
 

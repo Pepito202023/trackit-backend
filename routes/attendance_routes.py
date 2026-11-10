@@ -323,6 +323,20 @@ def get_all_attendance_records():
             )
             all_records.extend(recs)
         records = all_records
+    elif effective_role == 'supervisor':
+        # Supervisors see only attendance records for their assigned students
+        my_students = svc.get_students_by_supervisor(current_user_id)
+        student_ids = {s['id'] for s in my_students}
+        all_records = []
+        for sid in student_ids:
+            recs = svc.get_attendance_records(
+                user_id=sid,
+                date=date,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            all_records.extend(recs)
+        records = all_records
     else:
         records = svc.get_attendance_records(
             date=date,

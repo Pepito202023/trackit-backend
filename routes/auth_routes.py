@@ -94,7 +94,7 @@ def login():
     if not data:
         return jsonify({'error': 'No data provided'}), 400
 
-    email = data.get('email')
+    email = (data.get('email') or '').strip()
     id_number = data.get('idNumber')
     password = data.get('password')
     role = data.get('role', '').strip().lower() if data.get('role') else None
@@ -121,6 +121,20 @@ def login():
             return jsonify({'error': f'Access denied. Your account role is not "{role}".'}), 403
         # Ensure user object reflects the effective role
         user['role'] = effective_role
+
+        # Fix 5: If the stored name looks like a placeholder, use the email prefix
+        # as the display name in the response (does not write to Firestore).
+        _PASSWORD_LOGIN_PLACEHOLDER_NAMES = {
+            '', 'adviser', 'coordinator', 'supervisor', 'chairperson', 'chairman',
+            'student', 'admin', 'administrator', 'user', 'test', 'new adviser',
+            'new user', 'staff', 'teacher', 'employee',
+        }
+        stored_name = (user.get('name') or '').strip()
+        if stored_name.lower() in _PASSWORD_LOGIN_PLACEHOLDER_NAMES:
+            login_email = (user.get('email') or email or '').strip()
+            if login_email and '@' in login_email:
+                user['name'] = login_email.split('@')[0]
+
         access_token = create_access_token(
             identity=user['id'],
             additional_claims={'role': effective_role},
@@ -485,9 +499,21 @@ def google_login():
 
     # ── Look up the user in Firestore by verified Google email ───────────────
     # get_all_users() returns every user doc with passwords already stripped.
+    # If quota is exceeded it returns [], so fall back to a direct email query.
     all_users = svc.get_all_users()
-    matched_user = None
     print(f"[Google Login] Looking up email={google_email!r} among {len(all_users)} users")
+
+    # If the list is suspiciously empty, try a targeted single-user lookup by email
+    if not all_users:
+        try:
+            direct_list = svc.find_users_by_email(google_email)
+            if direct_list:
+                all_users = direct_list
+                print(f"[Google Login] Fallback direct lookup found {len(direct_list)} user(s)")
+        except Exception as _e:
+            print(f"[Google Login] Direct email lookup also failed: {_e}")
+
+    matched_user = None
 
     for u in all_users:
         u_email = (u.get('email') or '').strip().lower()

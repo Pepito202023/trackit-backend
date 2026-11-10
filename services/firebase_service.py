@@ -405,55 +405,89 @@ class FirebaseService:
         return user_data
 
     # Authentication Methods
+    def _find_user_docs_by_email(self, email: str):
+        """Return (doc_id, user_data) pairs for every user doc matching email.
+
+        Firestore '==' is case-sensitive, so query both the raw input and its
+        lowercase form, then dedupe by document ID. Also matches stored emails
+        case-insensitatively as a fallback for legacy mixed-case records.
+        """
+        raw = (email or '').strip()
+        lowered = raw.lower()
+        variants = {v for v in (raw, lowered) if v}
+        seen = set()
+        results = []
+
+        def _collect(stream):
+            for user_doc in stream:
+                if user_doc.id in seen:
+                    continue
+                seen.add(user_doc.id)
+                user_data = user_doc.to_dict()
+                user_data['id'] = user_doc.id
+                results.append((user_doc, user_data))
+
+        if self.db:
+            users_ref = self.db.collection('users')
+            for variant in variants:
+                _collect(users_ref.where('email', '==', variant).stream())
+
+            # Fallback: stored email may be mixed-case — scan only if the
+            # targeted queries found nothing (keeps the common path cheap).
+            if not results:
+                for user_doc in users_ref.stream():
+                    stored = (user_doc.to_dict().get('email') or '').strip().lower()
+                    if stored == lowered:
+                        _collect(iter([user_doc]))
+        else:
+            if not hasattr(self, 'users_db'):
+                self._init_in_memory_storage()
+            for uid, u in self.users_db.items():
+                if (u.get('email') or '').strip().lower() == lowered:
+                    results.append((None, dict(u)))
+
+        return results
+
     def verify_user(self, email: str, password: str, role: str = None) -> Dict:
         """Verify user credentials by email (supports multiple accounts per email)."""
         try:
             requested_role = self._effective_role(role) if role else None
+            email = (email or '').strip()
 
-            if self.db:
-                users_ref = self.db.collection('users')
-                candidates = []
-                for user_doc in users_ref.where('email', '==', email).stream():
-                    user_data = user_doc.to_dict()
-                    user_data['id'] = user_doc.id
-                    user_data = self._normalize_user_role(user_data, user_doc.reference)
-                    if self._password_matches(user_data, password):
-                        candidates.append(user_data)
+            all_matches = self._find_user_docs_by_email(email)
 
-                if not candidates:
-                    return {'success': False, 'error': 'Invalid email or password'}
+            normalized_matches = []
+            for doc_ref, user_data in all_matches:
+                user_data = self._normalize_user_role(user_data, doc_ref)
+                normalized_matches.append(user_data)
 
-                if requested_role:
-                    for user_data in candidates:
-                        if self._effective_role(user_data.get('role', '')) == requested_role:
-                            return {'success': True, 'user': user_data}
-                    return {
-                        'success': False,
-                        'error': f'Access denied. No account with role "{role}" for this email.',
-                    }
+            if not normalized_matches:
+                return {'success': False, 'error': 'No account found with this email address.'}
 
-                return {'success': True, 'user': candidates[0]}
-            else:
-                if not hasattr(self, 'users_db'):
-                    self._init_in_memory_storage()
-                candidates = []
-                for user in self.users_db.values():
-                    if user.get('email') == email:
-                        u = dict(user)
-                        u = self._normalize_user_role(u)
-                        if self._password_matches(u, password):
-                            candidates.append(u)
-                if not candidates:
-                    return {'success': False, 'error': 'Invalid email or password'}
-                if requested_role:
-                    for user_data in candidates:
-                        if self._effective_role(user_data.get('role', '')) == requested_role:
-                            return {'success': True, 'user': user_data}
-                    return {
-                        'success': False,
-                        'error': f'Access denied. No account with role "{role}" for this email.',
-                    }
-                return {'success': True, 'user': candidates[0]}
+            # Disabled / suspended accounts cannot sign in.
+            for user_data in normalized_matches:
+                status = (user_data.get('status') or '').strip().lower()
+                if status in ('disabled', 'inactive', 'suspended', 'banned'):
+                    return {'success': False, 'error': 'This account has been disabled. Contact the system administrator.'}
+
+            candidates = [
+                u for u in normalized_matches
+                if self._password_matches(u, password)
+            ]
+
+            if not candidates:
+                return {'success': False, 'error': 'Incorrect password. Please try again.'}
+
+            if requested_role:
+                for user_data in candidates:
+                    if self._effective_role(user_data.get('role', '')) == requested_role:
+                        return {'success': True, 'user': user_data}
+                return {
+                    'success': False,
+                    'error': f'Access denied. No account with role "{role}" for this email.',
+                }
+
+            return {'success': True, 'user': candidates[0]}
         except Exception as e:
             err_str = str(e)
             print(f"Error verifying user: {e}")
@@ -463,13 +497,19 @@ class FirebaseService:
                 _time.sleep(2)
                 try:
                     if self.db:
-                        for user_doc in self.db.collection('users').where('email', '==', email).stream():
-                            user_data = user_doc.to_dict()
-                            user_data['id'] = user_doc.id
-                            user_data = self._normalize_user_role(user_data, user_doc.reference)
-                            if self._password_matches(user_data, password):
-                                return {'success': True, 'user': user_data}
-                        return {'success': False, 'error': 'Invalid email or password'}
+                        lowered = (email or '').strip().lower()
+                        seen_ids = set()
+                        for variant in {v for v in ((email or '').strip(), lowered) if v}:
+                            for user_doc in self.db.collection('users').where('email', '==', variant).stream():
+                                if user_doc.id in seen_ids:
+                                    continue
+                                seen_ids.add(user_doc.id)
+                                user_data = user_doc.to_dict()
+                                user_data['id'] = user_doc.id
+                                user_data = self._normalize_user_role(user_data, user_doc.reference)
+                                if self._password_matches(user_data, password):
+                                    return {'success': True, 'user': user_data}
+                        return {'success': False, 'error': 'Incorrect password. Please try again.'}
                 except Exception as e2:
                     print(f"Retry also failed: {e2}")
                     return {'success': False, 'error': 'Service temporarily busy. Please try again in a moment.'}

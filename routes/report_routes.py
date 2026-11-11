@@ -66,10 +66,10 @@ def _staff_can_view_all_reports(role: str) -> bool:
 
 
 def _can_review_reports(role: str) -> bool:
-    """Advisers, coordinators, and chairmen may approve or return accomplishment reports."""
+    """Advisers, coordinators, chairmen, and supervisors may approve or return accomplishment reports."""
     r = (role or '').lower().strip()
     effective = ROLE_ALIASES.get(r, r)
-    return effective in {'adviser', 'coordinator', 'chairman'}
+    return effective in {'adviser', 'coordinator', 'chairman', 'supervisor'}
 
 
 def _can_see_approval_details(role: str) -> bool:
@@ -197,8 +197,27 @@ def get_reports():
 
     user_role = _resolve_user_role(current_user_id)
 
-    if user_role == 'adviser':
-        # Adviser: only see reports from their assigned students
+    if user_role == 'supervisor':
+        # Supervisor: only see reports from their assigned students
+        my_students = svc.get_students_by_supervisor(current_user_id)
+        student_ids = [s['id'] for s in my_students]
+        if student_id:
+            student_ids = [sid for sid in student_ids if sid == student_id]
+        all_reports = []
+        for sid in student_ids:
+            reps = svc.get_reports(
+                student_id=sid,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            all_reports.extend(reps)
+        # Supervisor sees all reports for their students; filter by status if provided
+        if status:
+            reports = [r for r in all_reports if r.get('status') == status]
+        else:
+            reports = all_reports
+    elif user_role == 'adviser':
+        # Adviser: see reports from their assigned students that are supervisor_approved
         my_students = svc.get_students_by_adviser(current_user_id)
         student_ids = [s['id'] for s in my_students]
         if student_id:
@@ -208,12 +227,19 @@ def get_reports():
         for sid in student_ids:
             reps = svc.get_reports(
                 student_id=sid,
-                status=status,
                 start_date=start_date,
                 end_date=end_date,
             )
             all_reports.extend(reps)
-        reports = all_reports
+        # Adviser sees reports that are supervisor_approved (waiting for them) or already adviser-reviewed
+        # Also include any where adviserId matches current user
+        relevant_statuses = {'supervisor_approved', 'adviser_approved', 'approved', 'returned_by_adviser'}
+        if status:
+            reports = [r for r in all_reports if r.get('status') == status]
+        else:
+            reports = [r for r in all_reports
+                       if r.get('status') in relevant_statuses
+                       or r.get('adviserId') == current_user_id]
     elif _staff_can_view_all_reports(user_role):
         # Coordinator / chairman / supervisor: see all
         reports = svc.get_reports(
@@ -383,30 +409,54 @@ def delete_report(report_id):
 @report_bp.route('/<report_id>/review', methods=['POST'])
 @jwt_required()
 def review_report(report_id):
-    """Review and approve/return report (adviser, coordinator, or chairman).
-    On approval, saves approvedByName and approvedAt for coordinator/chairman display.
+    """Review and approve/return report.
+    Two-level workflow:
+      - Supervisor: sets status to 'supervisor_approved' or 'returned_by_supervisor'
+      - Adviser: sets status to 'adviser_approved'/'approved' or 'returned_by_adviser'
+      - Coordinator/Chairman: direct 'approved' or 'returned'
+    On supervisor approval, automatically sets adviserId from the student's record.
     """
     current_user_id = get_jwt_identity()
     user_role = _resolve_user_role(current_user_id)
     if not _can_review_reports(user_role):
-        return jsonify({'error': 'Only advisers, coordinators, and chairmen can approve or return reports'}), 403
+        return jsonify({'error': 'Only supervisors, advisers, coordinators, and chairmen can approve or return reports'}), 403
 
-    data = request.get_json()
+    data = request.get_json() or {}
 
-    status = data.get('status')  # 'approved' or 'returned'
-    feedback = data.get('feedback', '')
+    status = data.get('status', '')
+    feedback = data.get('feedback', '') or data.get('comments', '')
 
-    if status not in ['approved', 'returned']:
+    # Valid statuses per role
+    SUPERVISOR_STATUSES = {'supervisor_approved', 'returned_by_supervisor'}
+    ADVISER_STATUSES    = {'adviser_approved', 'approved', 'returned_by_adviser'}
+    STAFF_STATUSES      = {'approved', 'returned', 'supervisor_approved', 'adviser_approved',
+                           'returned_by_supervisor', 'returned_by_adviser', 'pending'}
+
+    if user_role == 'supervisor' and status not in SUPERVISOR_STATUSES:
+        return jsonify({'error': f'Supervisors can only set status to: {", ".join(SUPERVISOR_STATUSES)}'}), 400
+    elif user_role == 'adviser' and status not in ADVISER_STATUSES:
+        return jsonify({'error': f'Advisers can only set status to: {", ".join(ADVISER_STATUSES)}'}), 400
+    elif user_role in {'coordinator', 'chairman'} and status not in STAFF_STATUSES:
+        return jsonify({'error': 'Invalid status'}), 400
+    elif user_role not in {'supervisor', 'adviser', 'coordinator', 'chairman'}:
         return jsonify({'error': 'Invalid status'}), 400
 
     svc = _get_service()
+    report = svc.get_report(report_id)
+    if not report:
+        return jsonify({'error': 'Report not found'}), 404
+
     reviewer = svc.get_user(current_user_id)
     reviewer_name = (reviewer.get('name', '') if reviewer else '').strip()
-    # Fallback: if name is blank, use email (prevents storing an empty approvedByName)
     if not reviewer_name and reviewer:
         reviewer_name = (reviewer.get('email', '') or '').strip()
 
-    now = datetime.now(timezone.utc).isoformat()
+    # Use Asia/Manila timezone
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo('Asia/Manila')).isoformat()
+    except Exception:
+        now = datetime.now(timezone.utc).isoformat()
 
     update_data = {
         'status': status,
@@ -416,22 +466,82 @@ def review_report(report_id):
         'updatedAt': now,
     }
 
-    # Store approval details for coordinator/chairman display
-    if status == 'approved':
-        update_data['approvedBy'] = current_user_id
-        update_data['approvedByName'] = reviewer_name
-        update_data['approvedAt'] = now
+    if user_role == 'supervisor':
+        if status == 'supervisor_approved':
+            # Save supervisor approval record
+            update_data['supervisorApproval'] = {
+                'userId': current_user_id,
+                'name': reviewer_name,
+                'decision': 'approved',
+                'timestamp': now,
+            }
+            # Automatically set adviserId from the student's record
+            student_id = report.get('studentId')
+            if student_id:
+                student = svc.get_user(student_id)
+                if student:
+                    adviser_id = student.get('adviserId') or student.get('adviser_id') or ''
+                    if adviser_id:
+                        update_data['adviserId'] = adviser_id
+        elif status == 'returned_by_supervisor':
+            update_data['supervisorApproval'] = {
+                'userId': current_user_id,
+                'name': reviewer_name,
+                'decision': 'returned',
+                'comments': feedback,
+                'timestamp': now,
+            }
+            # Reset to pending so student can resubmit
+            update_data['status'] = 'pending'
+
+    elif user_role == 'adviser':
+        # Verify report is in supervisor_approved state
+        current_status = report.get('status', '')
+        if current_status not in ('supervisor_approved',) and status != 'returned_by_adviser':
+            # Still allow if coordinator/chairman; just for adviser enforce workflow
+            pass  # Advisers can also act on direct-submitted reports for backwards compat
+
+        if status in ('adviser_approved', 'approved'):
+            update_data['status'] = 'adviser_approved'
+            update_data['adviserApproval'] = {
+                'userId': current_user_id,
+                'name': reviewer_name,
+                'decision': 'approved',
+                'timestamp': now,
+            }
+            # Keep legacy approvedBy/approvedByName for coordinator display
+            update_data['approvedBy'] = current_user_id
+            update_data['approvedByName'] = reviewer_name
+            update_data['approvedAt'] = now
+        elif status == 'returned_by_adviser':
+            update_data['adviserApproval'] = {
+                'userId': current_user_id,
+                'name': reviewer_name,
+                'decision': 'returned',
+                'comments': feedback,
+                'timestamp': now,
+            }
+            # Reset to pending so student resubmits (workflow starts from supervisor again)
+            update_data['status'] = 'pending'
+            update_data['approvedBy'] = None
+            update_data['approvedByName'] = None
+            update_data['approvedAt'] = None
+
     else:
-        # Returning a report clears any previous approval details
-        update_data['approvedBy'] = None
-        update_data['approvedByName'] = None
-        update_data['approvedAt'] = None
+        # Coordinator / Chairman: legacy direct approval
+        if status == 'approved':
+            update_data['approvedBy'] = current_user_id
+            update_data['approvedByName'] = reviewer_name
+            update_data['approvedAt'] = now
+        else:
+            update_data['approvedBy'] = None
+            update_data['approvedByName'] = None
+            update_data['approvedAt'] = None
 
     result = svc.update_report(report_id, update_data)
 
     if result['success']:
         report_out = result['report']
-        # Return full report only to coordinator/chairman; strip for others
         if not _can_see_approval_details(user_role):
             report_out = _strip_approval_fields(report_out)
         return jsonify({'success': True, 'report': report_out}), 200

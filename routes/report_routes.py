@@ -261,6 +261,36 @@ def get_reports():
     if not _can_see_approval_details(user_role):
         reports = [_strip_approval_fields(r) for r in reports]
 
+    # Enrich reports with supervisor and adviser names from user records
+    _user_cache = {}
+    def _get_cached_user(uid):
+        if not uid: return {}
+        if uid not in _user_cache:
+            _user_cache[uid] = svc.get_user(uid) or {}
+        return _user_cache[uid]
+
+    for rep in reports:
+        # Supervisor name
+        sup_id = rep.get('supervisorId')
+        if sup_id and not rep.get('supervisorName'):
+            sup_user = _get_cached_user(sup_id)
+            if sup_user.get('name'):
+                rep['supervisorName'] = sup_user['name']
+        # Adviser name
+        adv_id = rep.get('adviserId')
+        if adv_id and not rep.get('adviserName'):
+            adv_user = _get_cached_user(adv_id)
+            if adv_user.get('name'):
+                rep['adviserName'] = adv_user['name']
+        # Also enrich supervisorApproval.name if missing
+        sup_appr = rep.get('supervisorApproval')
+        if isinstance(sup_appr, dict) and not sup_appr.get('name') and rep.get('supervisorName'):
+            sup_appr['name'] = rep['supervisorName']
+        # Enrich adviserApproval.name if missing
+        adv_appr = rep.get('adviserApproval')
+        if isinstance(adv_appr, dict) and not adv_appr.get('name') and rep.get('adviserName'):
+            adv_appr['name'] = rep['adviserName']
+
     return jsonify(reports), 200
 
 

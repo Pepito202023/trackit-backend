@@ -1864,7 +1864,8 @@ class FirebaseService:
                     # snapshots from Transaction.get(), not a single snapshot.
                     snapshots = list(transaction.get(doc_ref))
                     snapshot = snapshots[0] if snapshots else None
-                    if snapshot is None or not snapshot.exists:
+                    if snapshot is not None and snapshot.exists:
+                        # Document already exists — return conflict so caller can update it
                         existing = snapshot.to_dict() or {}
                         existing['id'] = snapshot.id
                         return {
@@ -1872,6 +1873,7 @@ class FirebaseService:
                             'conflict': True,
                             'record': existing,
                         }
+                    # Document doesn't exist — create it
                     transaction.set(doc_ref, clean_record)
                     return {
                         'success': True,

@@ -1361,6 +1361,13 @@ class FirebaseService:
             'faceData', 'checkInBase64', 'checkOutBase64',
             'facePhotoBase64', 'imageBase64', 'photoBase64',
         }
+        # Photo URL fields that may legitimately contain base64 data: URIs
+        # when Firebase Storage is unavailable (Spark plan).
+        # These are kept so face photos appear in the web admin.
+        KEEP_BASE64_FIELDS = {
+            'checkInFacePhotoUrl', 'checkOutFacePhotoUrl',
+            'checkInPhotoUrl', 'checkOutPhotoUrl', 'facePhotoUrl',
+        }
         def _is_base64_blob(v):
             if not isinstance(v, str):
                 return False
@@ -1377,8 +1384,8 @@ class FirebaseService:
                 for k, v in obj.items():
                     if k in BASE64_FIELDS:
                         continue  # drop the whole field
-                    if _is_base64_blob(v):
-                        continue  # drop inline blob
+                    if k not in KEEP_BASE64_FIELDS and _is_base64_blob(v):
+                        continue  # drop inline blob only if not a photo URL field
                     result[k] = _clean(v)
                 return result
             if isinstance(obj, list):

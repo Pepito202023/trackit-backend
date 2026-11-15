@@ -2377,25 +2377,26 @@ class FirebaseService:
     
     # Message Methods
     def get_conversations(self, user_id: str) -> List[Dict]:
-        """Get all conversations for a user"""
+        """Get all conversations for a user.
+        Coordinators and chairpersons also see all group conversations."""
         try:
             if self.db:
                 conversations_ref = self.db.collection('conversations')
+
+                # Fetch conversations where user is a participant
                 query = conversations_ref.where('participants', 'array_contains', user_id)
-                
+                seen_ids = set()
                 conversations = []
+
                 for doc in query.get():
                     conv_data = doc.to_dict()
                     conv_data['id'] = doc.id
-                    # Resolve participant names
+                    seen_ids.add(doc.id)
                     participants = conv_data.get('participants', [])
                     participant_names = {}
                     for pid in participants:
-                        user = self.get_user(pid)
-                        if user:
-                            participant_names[pid] = user.get('name', pid)
-                        else:
-                            participant_names[pid] = pid
+                        u = self.get_user(pid)
+                        participant_names[pid] = u.get('name', pid) if u else pid
                     conv_data['participantNames'] = participant_names
                     # Set a friendly display name for the other participant
                     other_ids = [p for p in participants if p != user_id]
@@ -2432,7 +2433,32 @@ class FirebaseService:
                         conv_data['unreadCount'] = 0
 
                     conversations.append(conv_data)
-                
+
+                # Coordinators and chairpersons also see ALL group chats
+                current_user = self.get_user(user_id)
+                if current_user:
+                    role = self.ROLE_ALIASES.get(
+                        (current_user.get('role') or '').lower().strip(),
+                        (current_user.get('role') or '').lower().strip()
+                    )
+                    if role in ('coordinator', 'chairman'):
+                        all_groups = conversations_ref.where('isGroup', '==', True).get()
+                        for doc in all_groups:
+                            if doc.id in seen_ids:
+                                continue
+                            g_data = doc.to_dict()
+                            g_data['id'] = doc.id
+                            participants = g_data.get('participants', [])
+                            p_names = {}
+                            for pid in participants:
+                                u = self.get_user(pid)
+                                p_names[pid] = u.get('name', pid) if u else pid
+                            g_data['participantNames'] = p_names
+                            g_data['hasUnread'] = False
+                            g_data['unreadCount'] = 0
+                            conversations.append(g_data)
+                            seen_ids.add(doc.id)
+
                 return conversations
             else:
                 conversations = []

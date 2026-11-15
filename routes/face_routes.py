@@ -688,10 +688,10 @@ def verify_face_for_attendance():
     Uses stricter thresholds than /api/face/verify and intentionally has NO
     blink near-pass bypass (blink bonus is informational only).
 
-    Strict thresholds:
-      - Descriptor distance  ≤ 0.50
-      - Landmark distance    ≤ 0.16
-      - Photo score          ≥ 0.38 AND gray_score ≥ 0.26
+    Thresholds (relaxed for mobile camera variance):
+      - Descriptor distance  ≤ 0.55
+      - Landmark distance    ≤ 0.20
+      - Photo score          ≥ 0.30 AND gray_score ≥ 0.20
 
     Returns 403 if the student has no registered face at all.
     Returns { verified: bool, similarity: float, message: str, photoUrl: str }
@@ -742,15 +742,15 @@ def verify_face_for_attendance():
     verified = False
     message = MATCH_MSG
 
-    # ── Path A: 128-d descriptor (STRICT: ≤ 0.50) ────────────────────────────
+    # ── Path A: 128-d descriptor (≤ 0.55 for mobile camera variance) ──────────
     desc_dist = None
     descriptor_ok = False
     if stored_descriptor and live_descriptor:
         desc_dist = _descriptor_distance(stored_descriptor, live_descriptor)
-        descriptor_ok = desc_dist <= 0.50
+        descriptor_ok = desc_dist <= 0.55
         confidence = max(0.0, 1.0 - (desc_dist / 0.6))
 
-    # ── Path B: Landmark geometry (STRICT: ≤ 0.16) ───────────────────────────
+    # ── Path B: Landmark geometry (≤ 0.20 for mobile pose variance) ──────────
     landmark_ok = False
     lm_dist = None
     live_lm_data = None
@@ -758,11 +758,11 @@ def verify_face_for_attendance():
         live_lm_data = _extract_landmarks_from_mlkit(mlkit_dict)
     if stored_face_data and live_lm_data:
         lm_dist = _landmark_distance(stored_face_data, live_lm_data)
-        landmark_ok = lm_dist <= 0.16
-        lm_confidence = max(0.0, 1.0 - (lm_dist / 0.16))
+        landmark_ok = lm_dist <= 0.20
+        lm_confidence = max(0.0, 1.0 - (lm_dist / 0.20))
         confidence = max(confidence, lm_confidence)
 
-    # ── Path C: Pixel/histogram photo comparison (STRICT: ≥ 0.38 AND ≥ 0.26) ─
+    # ── Path C: Pixel/histogram photo comparison (≥ 0.30 AND ≥ 0.20) ─────────
     photo_score = 0.0
     gray_score = 0.0
     photo_ok = False
@@ -776,7 +776,7 @@ def verify_face_for_attendance():
         photo_score, gray_score = _image_match_score(
             registered_photo, image_bytes, stored_face_data, mlkit_dict
         )
-        photo_ok = photo_score >= 0.38 and gray_score >= 0.26
+        photo_ok = photo_score >= 0.30 and gray_score >= 0.20
         if desc_dist is None and not landmark_ok:
             confidence = max(confidence, photo_score)
 

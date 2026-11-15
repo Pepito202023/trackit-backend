@@ -323,6 +323,7 @@ def send_message(conversation_id):
         message = {
             'conversationId': conversation_id,
             'senderId': current_user_id,
+            'senderName': svc.get_user(current_user_id).get('name', '') if svc.get_user(current_user_id) else '',
             'content': content,
             'type': 'file' if attachment else message_type,
             'read': False,
@@ -344,9 +345,13 @@ def send_message(conversation_id):
     if not content:
         return jsonify({'error': 'Message content is required'}), 400
 
+    sender_user = svc.get_user(current_user_id)
+    sender_name = sender_user.get('name', '') if sender_user else ''
+
     message = {
         'conversationId': conversation_id,
         'senderId': current_user_id,
+        'senderName': sender_name,
         'content': content,
         'type': message_type,
         'read': False,
@@ -649,3 +654,167 @@ def broadcast_message():
             sent_count += 1
 
     return jsonify({'success': True, 'sentTo': sent_count}), 200
+
+
+# ── GROUP CHAT ROUTES ──────────────────────────────────────────────────────
+
+@message_bp.route('/groups', methods=['POST'])
+@jwt_required()
+def create_group():
+    """Create a group conversation. Only coordinator and chairman may create."""
+    svc = _get_service()
+    current_user_id = get_jwt_identity()
+
+    user = svc.get_user(current_user_id)
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 403
+    user_role = _effective_role(user.get('role', ''))
+    if user_role not in {'coordinator', 'chairman'}:
+        return jsonify({'error': 'Only coordinators and chairpersons can create group chats'}), 403
+
+    data = request.get_json() or {}
+    group_name = (data.get('groupName') or '').strip()
+    member_ids  = data.get('memberIds') or []
+
+    if not group_name:
+        return jsonify({'error': 'Group name is required'}), 400
+    if not isinstance(member_ids, list) or len(member_ids) < 1:
+        return jsonify({'error': 'At least one member is required'}), 400
+
+    # Always include creator
+    all_participants = list({current_user_id, *member_ids})
+
+    now = datetime.now(timezone.utc).isoformat()
+    conversation = {
+        'isGroup':      True,
+        'groupName':    group_name,
+        'groupPicture': data.get('groupPicture', ''),
+        'participants': all_participants,
+        'createdBy':    current_user_id,
+        'createdAt':    now,
+        'lastMessage':  '',
+        'lastMessageAt': now,
+    }
+
+    try:
+        if svc.db:
+            doc_ref = svc.db.collection('conversations').add(conversation)
+            conversation['id'] = doc_ref[1].id
+        else:
+            conv_id = f"grp{len(svc.conversations_db) + 1}"
+            conversation['id'] = conv_id
+            svc.conversations_db[conv_id] = conversation
+        return jsonify({'success': True, 'conversation': conversation}), 201
+    except Exception as e:
+        print(f"[ERROR] create_group: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@message_bp.route('/groups/<conversation_id>', methods=['PATCH'])
+@jwt_required()
+def update_group(conversation_id):
+    """Update group name, picture, or members. Only creator may update."""
+    svc = _get_service()
+    current_user_id = get_jwt_identity()
+    data = request.get_json() or {}
+
+    try:
+        if svc.db:
+            doc_ref = svc.db.collection('conversations').document(conversation_id)
+            doc = doc_ref.get()
+            if not doc.exists:
+                return jsonify({'error': 'Group not found'}), 404
+            conv = doc.to_dict()
+        else:
+            conv = svc.conversations_db.get(conversation_id)
+            if not conv:
+                return jsonify({'error': 'Group not found'}), 404
+
+        if not conv.get('isGroup'):
+            return jsonify({'error': 'Not a group conversation'}), 400
+        if conv.get('createdBy') != current_user_id:
+            return jsonify({'error': 'Only the group creator can edit it'}), 403
+
+        updates = {}
+        if 'groupName' in data and data['groupName'].strip():
+            updates['groupName'] = data['groupName'].strip()
+        if 'groupPicture' in data:
+            updates['groupPicture'] = data['groupPicture']
+        if 'memberIds' in data and isinstance(data['memberIds'], list):
+            updates['participants'] = list({conv.get('createdBy', current_user_id), *data['memberIds']})
+
+        if not updates:
+            return jsonify({'error': 'Nothing to update'}), 400
+
+        if svc.db:
+            doc_ref.update(updates)
+        else:
+            svc.conversations_db[conversation_id].update(updates)
+
+        return jsonify({'success': True}), 200
+    except Exception as e:
+        print(f"[ERROR] update_group: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@message_bp.route('/groups/<conversation_id>', methods=['DELETE'])
+@jwt_required()
+def delete_group(conversation_id):
+    """Delete a group. Only creator may delete."""
+    svc = _get_service()
+    current_user_id = get_jwt_identity()
+
+    try:
+        if svc.db:
+            doc_ref = svc.db.collection('conversations').document(conversation_id)
+            doc = doc_ref.get()
+            if not doc.exists:
+                return jsonify({'error': 'Group not found'}), 404
+            conv = doc.to_dict()
+            if not conv.get('isGroup'):
+                return jsonify({'error': 'Not a group'}), 400
+            if conv.get('createdBy') != current_user_id:
+                return jsonify({'error': 'Only the creator can delete this group'}), 403
+            doc_ref.delete()
+        else:
+            conv = svc.conversations_db.get(conversation_id)
+            if not conv:
+                return jsonify({'error': 'Group not found'}), 404
+            if conv.get('createdBy') != current_user_id:
+                return jsonify({'error': 'Only the creator can delete this group'}), 403
+            del svc.conversations_db[conversation_id]
+
+        return jsonify({'success': True}), 200
+    except Exception as e:
+        print(f"[ERROR] delete_group: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@message_bp.route('/groups/<conversation_id>/leave', methods=['POST'])
+@jwt_required()
+def leave_group(conversation_id):
+    """Leave a group chat."""
+    svc = _get_service()
+    current_user_id = get_jwt_identity()
+
+    try:
+        if svc.db:
+            doc_ref = svc.db.collection('conversations').document(conversation_id)
+            doc = doc_ref.get()
+            if not doc.exists:
+                return jsonify({'error': 'Group not found'}), 404
+            conv = doc.to_dict()
+            if not conv.get('isGroup'):
+                return jsonify({'error': 'Not a group'}), 400
+            participants = [p for p in conv.get('participants', []) if p != current_user_id]
+            doc_ref.update({'participants': participants})
+        else:
+            conv = svc.conversations_db.get(conversation_id)
+            if not conv:
+                return jsonify({'error': 'Group not found'}), 404
+            conv['participants'] = [p for p in conv.get('participants', []) if p != current_user_id]
+
+        return jsonify({'success': True}), 200
+    except Exception as e:
+        print(f"[ERROR] leave_group: {e}")
+        return jsonify({'error': str(e)}), 500

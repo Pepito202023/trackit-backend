@@ -60,7 +60,7 @@ def _get_email_config():
     ef = (os.environ.get('TRACKIT_EMAIL_FROM') or '').strip()
     # Gmail App Passwords are 16 chars; strip spaces if the user pasted "xxxx xxxx xxxx xxxx"
     ep = ''.join((os.environ.get('TRACKIT_EMAIL_PASSWORD') or '').split())
-    wu = os.environ.get('TRACKIT_WEB_URL', 'http://127.0.0.1:5502/web_admin')
+    wu = os.environ.get('TRACKIT_WEB_URL', 'https://webadmin-lac.vercel.app')
     return ef, ep, wu
 
 # Keep these as lazy properties for backwards-compat with any code that imports them
@@ -72,7 +72,7 @@ def _EMAIL_PASS():  return os.environ.get('TRACKIT_EMAIL_PASSWORD', '')
 # should use email_service.EMAIL_FROM which we keep live via __getattr__ below.
 EMAIL_FROM    = os.environ.get('TRACKIT_EMAIL_FROM', '')
 EMAIL_PASS    = os.environ.get('TRACKIT_EMAIL_PASSWORD', '')
-WEB_BASE_URL  = os.environ.get('TRACKIT_WEB_URL', 'http://127.0.0.1:5502/web_admin')
+WEB_BASE_URL  = os.environ.get('TRACKIT_WEB_URL', 'https://webadmin-lac.vercel.app')
 
 print(f"[Email Service] Loaded. EMAIL_FROM present at import: {bool(EMAIL_FROM)}")
 

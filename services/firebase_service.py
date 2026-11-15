@@ -662,7 +662,7 @@ class FirebaseService:
                         return {'success': False, 'error': 'An account with this email and role already exists'}
                 doc_ref = self.db.collection('users').add(user_data)
                 user_data['id'] = doc_ref[1].id
-                user_data = self._provision_auth_for_new_user(user_data, password, doc_ref.reference)
+                user_data = self._provision_auth_for_new_user(user_data, password, doc_ref[1])
                 safe = dict(user_data)
                 safe.pop('password', None)
                 return {'success': True, 'user': safe}
@@ -743,7 +743,7 @@ class FirebaseService:
                 
                 doc_ref = self.db.collection('users').add(user_data)
                 user_data['id'] = doc_ref[1].id
-                user_data = self._provision_auth_for_new_user(user_data, password, doc_ref.reference)
+                user_data = self._provision_auth_for_new_user(user_data, password, doc_ref[1])
                 safe = dict(user_data)
                 safe.pop('password', None)
                 return {

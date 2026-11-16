@@ -290,9 +290,10 @@ def _start_keepalive():
     def _ping():
         # Give the server 20s to fully start before first ping
         time.sleep(20)
+        # Use RENDER_EXTERNAL_URL if set, otherwise fall back to known URL
         base = _os.environ.get('RENDER_EXTERNAL_URL', '').rstrip('/')
         if not base:
-            return  # not on Render — skip
+            base = 'https://trackit-backend-s6t6.onrender.com'
         url = f"{base}/api/health"
         while True:
             try:
@@ -300,7 +301,7 @@ def _start_keepalive():
                 print(f"[keep-alive] pinged {url}")
             except Exception as e:
                 print(f"[keep-alive] ping failed: {e}")
-            time.sleep(5 * 60)   # 5 minutes (more frequent to prevent sleep)
+            time.sleep(5 * 60)   # 5 minutes
     t = threading.Thread(target=_ping, daemon=True)
     t.start()
 

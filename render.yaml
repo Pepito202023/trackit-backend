@@ -13,6 +13,8 @@ services:
         value: 801818179102-k8urb95atjb6rsqm8mtpgnpsl7qq2tba.apps.googleusercontent.com
       - key: TRACKIT_WEB_URL
         value: https://webadmin-lac.vercel.app
+      - key: RENDER_EXTERNAL_URL
+        value: https://trackit-backend-s6t6.onrender.com
       # Set these manually in the Render dashboard:
       # FIREBASE_SERVICE_ACCOUNT_JSON  — paste the full serviceAccountKey JSON as one line
       # TRACKIT_EMAIL_FROM             — your Gmail address

@@ -38,8 +38,12 @@ _LAST_ERROR = None
 def _ensure_dotenv():
     try:
         from dotenv import load_dotenv
+        # backend/.env is one level up from backend/services/
         env_path = Path(__file__).resolve().parent.parent / '.env'
-        load_dotenv(env_path, override=False)
+        if not env_path.exists():
+            # Try same directory as app.py
+            env_path = Path(__file__).resolve().parent / '.env'
+        load_dotenv(env_path, override=True)
     except ImportError:
         pass
 

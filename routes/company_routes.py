@@ -9,6 +9,22 @@ from services.firebase_service import FirebaseService
 
 company_bp = Blueprint('companies', __name__)
 
+import time as _time
+_co_cache: dict = {}
+_CO_TTL = 60  # seconds — companies change rarely
+
+def _co_cache_get(key):
+    e = _co_cache.get(key)
+    if e and (_time.time() - e['ts']) < _CO_TTL:
+        return e['val']
+    return None
+
+def _co_cache_set(key, val):
+    _co_cache[key] = {'val': val, 'ts': _time.time()}
+
+def _co_cache_clear():
+    _co_cache.clear()
+
 _firebase_service = None
 
 
@@ -36,6 +52,12 @@ def list_companies():
     name contains the search string (case-insensitive substring match).
     """
     svc = _get_service()
+    search = (request.args.get('search') or '').strip().lower()
+    cache_key = f'companies:{search}'
+    cached = _co_cache_get(cache_key)
+    if cached is not None:
+        return jsonify(cached), 200
+
     companies = list(svc.get_companies() or [])
 
     # Include HTE profiles uploaded by coordinators/chairpersons so the
@@ -71,13 +93,13 @@ def list_companies():
     except Exception as e:
         print(f"[list_companies] HTE merge skipped: {e}")
 
-    search = (request.args.get('search') or '').strip().lower()
     if search:
         companies = [
             c for c in companies
             if search in (c.get('name') or '').strip().lower()
         ]
 
+    _co_cache_set(cache_key, companies)
     return jsonify(companies), 200
 
 

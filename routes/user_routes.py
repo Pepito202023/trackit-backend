@@ -31,6 +31,25 @@ user_bp = Blueprint('users', __name__)
 
 _firebase_service = None
 
+# ── Simple in-memory response cache (TTL: 30 seconds) ────────────────────────
+import time as _time
+_cache: dict = {}
+_CACHE_TTL = 30  # seconds
+
+def _cache_get(key):
+    entry = _cache.get(key)
+    if entry and (_time.time() - entry['ts']) < _CACHE_TTL:
+        return entry['val']
+    return None
+
+def _cache_set(key, val):
+    _cache[key] = {'val': val, 'ts': _time.time()}
+
+def _cache_clear(prefix=''):
+    keys = [k for k in list(_cache.keys()) if k.startswith(prefix)]
+    for k in keys:
+        _cache.pop(k, None)
+
 # Roles a coordinator may create via the admin panel
 COORDINATOR_CREATABLE_ROLES = {'student', 'adviser', 'supervisor', 'chairman'}
 VALID_ROLES = COORDINATOR_CREATABLE_ROLES | {'coordinator'}
@@ -922,19 +941,23 @@ def get_all_users():
     if caller_role == 'supervisor':
         current_user_id = get_jwt_identity()
         users = svc.get_students_by_supervisor(current_user_id)
-        # Apply role filter (supervisor dashboard always requests role=student,
-        # but be safe and honour any explicit filter the caller passes)
         if role_filter:
             users = [u for u in users if _effective_role(u.get('role', '')) == _effective_role(role_filter)]
         return jsonify([_with_public_photos(u) for u in users]), 200
 
+    cache_key = f'all_users:{role_filter or "all"}'
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return jsonify(cached), 200
+
     users = svc.get_all_users()
 
     if role_filter:
-        # Use _effective_role so aliases (admin→coordinator, employee→adviser) are resolved
         users = [u for u in users if _effective_role(u.get('role', '')) == _effective_role(role_filter)]
 
-    return jsonify([_with_public_photos(u) for u in users]), 200
+    result = [_with_public_photos(u) for u in users]
+    _cache_set(cache_key, result)
+    return jsonify(result), 200
 
 
 # ─────────────────────────────────────────────
@@ -1265,5 +1288,6 @@ def delete_user(user_id):
     result = svc.delete_user(user_id)
 
     if result.get('success'):
+        _cache_clear('all_users')
         return jsonify({'message': 'User deleted successfully'}), 200
     return jsonify({'error': result.get('error', 'Delete failed')}), 400

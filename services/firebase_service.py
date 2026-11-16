@@ -717,10 +717,22 @@ class FirebaseService:
                 existing = list(query.get())
                 
                 if existing:
-                    return {
-                        'success': False,
-                        'error': 'ID number already registered'
-                    }
+                    # Only block if the existing record has a valid name (not a ghost/partial record)
+                    existing_data = existing[0].to_dict()
+                    existing_name = (existing_data.get('name') or '').strip()
+                    existing_role = (existing_data.get('role') or '').strip()
+                    if existing_name and existing_role:
+                        return {
+                            'success': False,
+                            'error': 'ID number already registered'
+                        }
+                    else:
+                        # Ghost/incomplete record — delete it and allow re-creation
+                        print(f"[create_user_by_id] Removing ghost record for idNumber={id_number}")
+                        try:
+                            existing[0].reference.delete()
+                        except Exception:
+                            pass
                 
                 # Create new user in Firestore
                 user_data = {

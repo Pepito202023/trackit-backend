@@ -243,6 +243,8 @@ def create_user():
 
     if result.get('success'):
         user = result['user']
+        # Clear user cache so next GET /users returns fresh data
+        _cache_clear('all_users')
         # Fix 6: If an adviserId was provided (e.g. when creating a student),
         # link the student to the adviser on the newly created document.
         # Non-fatal: log the error but do not fail the whole creation.

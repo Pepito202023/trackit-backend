@@ -1293,3 +1293,37 @@ def delete_user(user_id):
         _cache_clear('all_users')
         return jsonify({'message': 'User deleted successfully'}), 200
     return jsonify({'error': result.get('error', 'Delete failed')}), 400
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLEANUP: DELETE stuck/incomplete user by ID number
+# DELETE /api/users/by-id-number/<id_number>
+# Coordinator/chairman only. Removes records that have the given idNumber but
+# are incomplete (no password hash) so the coordinator can recreate them.
+# ─────────────────────────────────────────────────────────────────────────────
+@user_bp.route('/by-id-number/<id_number>', methods=['DELETE'])
+@jwt_required()
+def delete_user_by_id_number(id_number):
+    """Remove a stuck/incomplete user record by ID number so it can be recreated."""
+    svc = _get_service()
+    caller_role = _current_user_role(svc)
+    if caller_role not in ('coordinator', 'chairman', 'admin'):
+        return jsonify({'error': 'Only coordinators and chairpersons can use this endpoint'}), 403
+
+    if not svc.db:
+        return jsonify({'error': 'Database not available'}), 503
+
+    try:
+        query = svc.db.collection('users').where('idNumber', '==', id_number).limit(5)
+        docs = list(query.get())
+        if not docs:
+            return jsonify({'error': f'No user found with ID number {id_number}'}), 404
+
+        deleted = 0
+        for doc in docs:
+            doc.reference.delete()
+            deleted += 1
+        _cache_clear('all_users')
+        return jsonify({'success': True, 'deleted': deleted, 'message': f'Removed {deleted} record(s) with idNumber={id_number}'}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500

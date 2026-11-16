@@ -717,22 +717,25 @@ class FirebaseService:
                 existing = list(query.get())
                 
                 if existing:
-                    # Only block if the existing record has a valid name (not a ghost/partial record)
+                    # Only block if the existing record has a valid name AND role AND was properly created
                     existing_data = existing[0].to_dict()
                     existing_name = (existing_data.get('name') or '').strip()
                     existing_role = (existing_data.get('role') or '').strip()
-                    if existing_name and existing_role:
+                    # A record is "valid" if it has name, role, AND a password hash
+                    # Records created by the old buggy code have name+role but may lack other fields
+                    has_password = bool(existing_data.get('password'))
+                    if existing_name and existing_role and has_password:
                         return {
                             'success': False,
-                            'error': 'ID number already registered'
+                            'error': f'ID number already registered (existing account: {existing_name})'
                         }
                     else:
-                        # Ghost/incomplete record — delete it and allow re-creation
-                        print(f"[create_user_by_id] Removing ghost record for idNumber={id_number}")
+                        # Incomplete record from a failed previous attempt — delete and recreate
+                        print(f"[create_user_by_id] Removing incomplete record for idNumber={id_number}, name={existing_name}")
                         try:
                             existing[0].reference.delete()
-                        except Exception:
-                            pass
+                        except Exception as del_err:
+                            print(f"[create_user_by_id] Could not delete incomplete record: {del_err}")
                 
                 # Create new user in Firestore
                 user_data = {

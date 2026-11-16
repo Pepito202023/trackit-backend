@@ -276,10 +276,14 @@ def test_email():
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """API health check"""
+    from services.email_service import _get_email_config
+    ef, ep, _ = _get_email_config()
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.utcnow().isoformat(),
-        'service': 'TrackIt API'
+        'service': 'TrackIt API',
+        'email_configured': bool(ef and ep),
+        'email_from': ef if ef else 'NOT SET'
     })
 
 

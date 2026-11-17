@@ -1,4 +1,4 @@
-"""
+﻿"""
 TrackIt System - Flask Backend
 Employee Attendance Management System
 """
@@ -305,7 +305,7 @@ def _start_keepalive():
                 print(f"[keep-alive] pinged {url}")
             except Exception as e:
                 print(f"[keep-alive] ping failed: {e}")
-            time.sleep(5 * 60)   # 5 minutes
+            time.sleep(3 * 60)  # ping every 3 minutes   # 5 minutes
     t = threading.Thread(target=_ping, daemon=True)
     t.start()
 

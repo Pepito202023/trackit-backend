@@ -1,4 +1,4 @@
-services:
+﻿services:
   - type: web
     name: trackit-backend
     runtime: python
@@ -12,10 +12,10 @@ services:
       - key: GOOGLE_CLIENT_ID
         value: 801818179102-k8urb95atjb6rsqm8mtpgnpsl7qq2tba.apps.googleusercontent.com
       - key: TRACKIT_WEB_URL
-        value: https://webadmin-lac.vercel.app
+        value: https://trackit-system-3fcdd.web.app
       - key: RENDER_EXTERNAL_URL
         value: https://trackit-backend-s6t6.onrender.com
       # Set these manually in the Render dashboard:
-      # FIREBASE_SERVICE_ACCOUNT_JSON  — paste the full serviceAccountKey JSON as one line
-      # TRACKIT_EMAIL_FROM             — your Gmail address
-      # TRACKIT_EMAIL_PASSWORD         — your Gmail App Password
+      # FIREBASE_SERVICE_ACCOUNT_JSON  â€” paste the full serviceAccountKey JSON as one line
+      # TRACKIT_EMAIL_FROM             â€” your Gmail address
+      # TRACKIT_EMAIL_PASSWORD         â€” your Gmail App Password

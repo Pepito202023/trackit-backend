@@ -10,7 +10,7 @@
       - key: JWT_SECRET_KEY
         generateValue: true
       - key: GOOGLE_CLIENT_ID
-        value: 801818179102-k8urb95atjb6rsqm8mtpgnpsl7qq2tba.apps.googleusercontent.com
+        value: 740194235229-9lap5diqbta3samct67v4o9baoufct7k.apps.googleusercontent.com
       - key: TRACKIT_WEB_URL
         value: https://trackit-system-3fcdd.web.app
       - key: RENDER_EXTERNAL_URL

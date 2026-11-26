@@ -97,6 +97,7 @@ def _send_account_setup_email(svc: FirebaseService, user: dict) -> tuple:
         except Exception as _e:
             print(f"[EMAIL SETUP] Could not store temp password: {_e}")
     try:
+        # Send email with temporary password directly (not setup link)
         sent = send_welcome_email(
             {**user, 'idNumber': user.get('idNumber') or ''},
             temp_pw,

@@ -721,16 +721,29 @@ class FirebaseService:
                     existing_data = existing[0].to_dict()
                     existing_name = (existing_data.get('name') or '').strip()
                     existing_role = (existing_data.get('role') or '').strip()
-                    # A record is "valid" if it has name, role, AND a password hash
-                    # Records created by the old buggy code have name+role but may lack other fields
                     has_password = bool(existing_data.get('password'))
+                    existing_email = (existing_data.get('email') or '').strip()
                     if existing_name and existing_role and has_password:
+                        # Account exists — resend credentials email instead of error
+                        existing_id = existing[0].id
+                        existing_data['id'] = existing_id
+                        print(f"[create_user_by_id] Account already exists for idNumber={id_number}, resending email to {existing_email}")
+                        try:
+                            from services.email_service import send_welcome_email
+                            email_sent = send_welcome_email(existing_data, password) if existing_email else False
+                        except Exception as mail_err:
+                            email_sent = False
+                            print(f"[create_user_by_id] Email resend failed: {mail_err}")
+                        safe = dict(existing_data)
+                        safe.pop('password', None)
                         return {
-                            'success': False,
-                            'error': f'ID number already registered (existing account: {existing_name})'
+                            'success': True,
+                            'user': safe,
+                            'emailSent': email_sent,
+                            'alreadyExisted': True
                         }
                     else:
-                        # Incomplete record from a failed previous attempt — delete and recreate
+                        # Incomplete record — delete and recreate
                         print(f"[create_user_by_id] Removing incomplete record for idNumber={id_number}, name={existing_name}")
                         try:
                             existing[0].reference.delete()

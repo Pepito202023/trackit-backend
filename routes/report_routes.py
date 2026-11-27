@@ -532,7 +532,10 @@ def review_report(report_id):
             pass  # Advisers can also act on direct-submitted reports for backwards compat
 
         if status in ('adviser_approved', 'approved'):
-            update_data['status'] = 'adviser_approved'
+            # If supervisor already approved, set status to 'approved' (both approved)
+            # Otherwise set to 'adviser_approved' (awaiting supervisor)
+            final_status = 'approved' if current_status == 'supervisor_approved' else 'adviser_approved'
+            update_data['status'] = final_status
             update_data['adviserApproval'] = {
                 'userId': current_user_id,
                 'name': reviewer_name,
